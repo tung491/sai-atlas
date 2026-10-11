@@ -8,9 +8,11 @@
 
 import { describe, expect, it } from "vitest";
 import {
+	escapeHtml,
 	extractImageDataUrl,
 	extractImageDataUrls,
 	formatShortClock,
+	markHtmlMatches,
 	resultDetails,
 	resultText,
 	sanitizeToolText,
@@ -127,5 +129,64 @@ describe("sanitizeToolText", () => {
 
 	it("handles color and tabs together", () => {
 		expect(sanitizeToolText("\x1b[1m\x1b[32mgreen\ttab\x1b[0m")).toBe("green    tab");
+	});
+});
+
+describe("escapeHtml", () => {
+	it.each([
+		["&", "&amp;"],
+		["<", "&lt;"],
+		[">", "&gt;"],
+		['"', "&quot;"],
+		["plain text 123", "plain text 123"],
+	])("escapes %j as %j", (input, expected) => {
+		expect(escapeHtml(input)).toBe(expected);
+	});
+
+	it("escapes & first, so existing entities print literally instead of decoding", () => {
+		expect(escapeHtml("&lt;b&gt;")).toBe("&amp;lt;b&amp;gt;");
+		expect(escapeHtml("<&>")).toBe("&lt;&amp;&gt;");
+	});
+
+	it("leaves no markup in hostile input", () => {
+		const out = escapeHtml('<img src=x onerror="alert(1)"><script>alert(2)</script>');
+		expect(out).toBe("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;&lt;script&gt;alert(2)&lt;/script&gt;");
+		expect(out).not.toMatch(/[<>"]/);
+	});
+});
+
+describe("markHtmlMatches", () => {
+	const mark = (text: string) => `<mark class="omp-hl">${text}</mark>`;
+
+	it("returns the HTML untouched for an empty pattern", () => {
+		expect(markHtmlMatches("a &lt; b", "")).toBe("a &lt; b");
+	});
+
+	it("marks case-insensitive literal matches, treating regex syntax as text", () => {
+		expect(markHtmlMatches(escapeHtml("Foo foo f.o"), "foo")).toBe(`${mark("Foo")} ${mark("foo")} f.o`);
+		expect(markHtmlMatches(escapeHtml("a.b axb"), "a.b")).toBe(`${mark("a.b")} axb`);
+	});
+
+	it.each([
+		["lt", "a < b", "a &lt; b"],
+		["amp", "x && y", "x &amp;&amp; y"],
+		["quot", 'say "hi"', "say &quot;hi&quot;"],
+	])("never matches %j inside the entities of %j", (pattern, source, escaped) => {
+		expect(markHtmlMatches(escapeHtml(source), pattern)).toBe(escaped);
+	});
+
+	it("still finds the search term as real text next to an entity", () => {
+		expect(markHtmlMatches(escapeHtml("alt < lt"), "lt")).toBe(`a${mark("lt")} &lt; ${mark("lt")}`);
+	});
+
+	it("matches escaped characters as whole entities", () => {
+		expect(markHtmlMatches(escapeHtml("if a < b && c"), "< b &")).toBe(`if a ${mark("&lt; b &amp;")}&amp; c`);
+		expect(markHtmlMatches("it&#x27;s", "'")).toBe(`it${mark("'")}s`);
+	});
+
+	it("never matches inside a highlight.js tag", () => {
+		const html = '<span class="hljs-keyword">class</span> Span';
+		expect(markHtmlMatches(html, "class")).toBe(`<span class="hljs-keyword">${mark("class")}</span> Span`);
+		expect(markHtmlMatches(html, "span")).toBe(`<span class="hljs-keyword">class</span> ${mark("Span")}`);
 	});
 });

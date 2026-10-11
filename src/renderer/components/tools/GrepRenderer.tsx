@@ -1,5 +1,5 @@
 import { Search } from "lucide-react";
-import { cx, escapeHtml, escapeRegExp, resultDetails, resultText } from "../../lib/format";
+import { cx, escapeHtml, markHtmlMatches, resultDetails, resultText } from "../../lib/format";
 import { useT } from "../../lib/i18n";
 import { GREP_PREVIEW_MATCHES, PREVIEW_SCROLL_MD, PREVIEW_SCROLL_SM } from "../../lib/preview";
 import { PathLink } from "./PathLink";
@@ -134,14 +134,9 @@ function countMatches(groups: FileGroup[]): number {
 
 /** Content with the search pattern wrapped in highlight marks (HTML-safe). */
 function HighlightedContent({ content, pattern }: { content: string; pattern: string }) {
-	const html = pattern
-		? escapeHtml(content).replace(
-				new RegExp(escapeRegExp(escapeHtml(pattern)), "gi"),
-				m => `<mark class="omp-hl">${m}</mark>`,
-			)
-		: escapeHtml(content);
+	const html = markHtmlMatches(escapeHtml(content), pattern);
 	return (
-		// biome-ignore lint/security/noDangerouslySetInnerHtml: content and pattern are escapeHtml'd first; only <mark> wrappers are added
+		// biome-ignore lint/security/noDangerouslySetInnerHtml: content is escapeHtml'd; markHtmlMatches re-escapes every text run and adds only <mark> wrappers
 		<span dangerouslySetInnerHTML={{ __html: html }} />
 	);
 }

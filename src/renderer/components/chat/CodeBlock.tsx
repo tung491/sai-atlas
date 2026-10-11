@@ -1,6 +1,6 @@
 import { Check, Copy } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { copyText, cx, escapeHtml, escapeRegExp } from "../../lib/format";
+import { copyText, cx, escapeHtml, markHtmlMatches } from "../../lib/format";
 import { getLoadedHljs, HIGHLIGHT_CHAR_CAP, loadHljs } from "../../lib/highlight";
 import { useT } from "../../lib/i18n";
 import { LineNumberGutter } from "./LineNumberGutter";
@@ -95,9 +95,9 @@ export function CodeBlock({
 
 	// Final rendered HTML: pre-highlighted input, lazy hljs output, or escaped
 	// plain code — with optional pattern matches wrapped in <mark>. Pattern
-	// highlighting runs on the rendered HTML (works for both raw and
-	// pre-highlighted sources). hljs output never contains a bare "<" in text,
-	// so wrapping text-level matches cannot split a tag.
+	// highlighting runs on the decoded text between the rendered HTML's tags
+	// (works for both raw and pre-highlighted sources), so a match never splits
+	// a tag or an entity.
 	const html = useMemo(() => {
 		// Over-cap code must ignore any cached highlight from a previous
 		// shorter value — otherwise the old source displays while Copy takes
@@ -105,14 +105,12 @@ export function CodeBlock({
 		const overCap = code != null && code.length > HIGHLIGHT_CHAR_CAP;
 		const base = overCap ? escapeHtml(code) : (highlightedHtml ?? hlHtml ?? (code != null ? escapeHtml(code) : null));
 		if (base == null) return null;
-		if (!highlightPattern) return base;
-		const re = new RegExp(escapeRegExp(highlightPattern), "gi");
-		return base.replace(re, m => `<mark class="omp-hl">${escapeHtml(m)}</mark>`);
+		return highlightPattern ? markHtmlMatches(base, highlightPattern) : base;
 	}, [highlightedHtml, hlHtml, code, highlightPattern]);
 
 	const codeElement =
 		html != null ? (
-			// biome-ignore lint/security/noDangerouslySetInnerHtml: hljs/escapeHtml output only; pattern matches are escapeHtml'd before the <mark> wrap
+			// biome-ignore lint/security/noDangerouslySetInnerHtml: hljs/escapeHtml output only; markHtmlMatches re-escapes text runs and adds only <mark> wrappers
 			<code className={`language-${lang}`} dangerouslySetInnerHTML={{ __html: html }} />
 		) : (
 			<code className={`language-${lang}`}>{code ?? ""}</code>

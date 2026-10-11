@@ -16,9 +16,12 @@ import type { ResolvedTheme } from "../../lib/theme";
 import { Spinner } from "../common/Spinner";
 import { CodeBlock } from "./CodeBlock";
 
+/** The part of the mermaid API the block drives. */
+export type MermaidRenderer = Pick<Mermaid, "initialize" | "render">;
+
 let mermaidPromise: Promise<Mermaid> | null = null;
-/** Theme key the shared mermaid singleton was last initialized with. */
-let initializedThemeKey: string | null = null;
+/** Theme key each renderer (the shared mermaid singleton) was last initialized with. */
+const initializedThemeKeys = new WeakMap<MermaidRenderer, string>();
 /** Rendered SVG cache, keyed by `${themeKey}:${fnv(source)}`. */
 const svgCache = new Map<string, string>();
 const CACHE_LIMIT = 50;
@@ -42,12 +45,32 @@ function hashSource(source: string): string {
 }
 
 /**
- * Defense in depth on top of securityLevel:"strict" (mermaid already encodes
- * label text): strip executable elements, inline event handlers, and
- * javascript: links from the rendered SVG before injecting it as HTML.
- * <style> and <foreignObject> (mermaid's label layout) are kept.
+ * Elements removed with their subtree: executable or loading elements, and the
+ * SMIL animation elements, which can rewrite another element's attributes after
+ * sanitization (`<set attributeName="href" to="javascript:…">`). Compared in
+ * lower case: the HTML parser keeps SVG's camelCase names (`animateMotion`).
  */
-function sanitizeSvg(svg: string): string {
+const DROPPED_SVG_ELEMENTS = new Set([
+	"script",
+	"iframe",
+	"object",
+	"embed",
+	"link",
+	"meta",
+	"set",
+	"animate",
+	"animatemotion",
+	"animatetransform",
+]);
+
+/**
+ * Defense in depth on top of securityLevel:"strict" (mermaid already encodes
+ * label text): strip executable elements, SMIL animations, inline event
+ * handlers, and javascript: links from the rendered SVG. <style> and
+ * <foreignObject> (mermaid's label layout) are kept; the result is only ever
+ * shown through a blob <img>, where neither scripts nor external loads run.
+ */
+export function sanitizeSvg(svg: string): string {
 	// Parse as HTML, not image/svg+xml: label HTML inside <foreignObject> is
 	// not guaranteed XML-wellformed (e.g. an unclosed <img> surviving strict
 	// sanitization), and strict XML parsing would reject valid diagrams.
@@ -57,8 +80,8 @@ function sanitizeSvg(svg: string): string {
 	if (!root) {
 		throw new Error("mermaid produced no SVG root");
 	}
-	for (const el of Array.from(root.querySelectorAll("script,iframe,object,embed,link,meta"))) {
-		el.remove();
+	for (const el of Array.from(root.querySelectorAll("*"))) {
+		if (DROPPED_SVG_ELEMENTS.has(el.localName.toLowerCase())) el.remove();
 	}
 	const scrub = (el: Element) => {
 		for (const attr of Array.from(el.attributes)) {
@@ -85,19 +108,23 @@ interface MermaidTheme {
 	key: string;
 }
 
-async function renderDiagram(source: string, theme: MermaidTheme): Promise<string> {
+async function renderDiagram(
+	source: string,
+	theme: MermaidTheme,
+	load: () => Promise<MermaidRenderer>,
+): Promise<string> {
 	const key = `${theme.key}:${hashSource(source)}`;
 	const cached = svgCache.get(key);
 	if (cached !== undefined) return cached;
-	const mermaid = await loadMermaid();
-	if (initializedThemeKey !== theme.key) {
+	const mermaid = await load();
+	if (initializedThemeKeys.get(mermaid) !== theme.key) {
 		const config: MermaidConfig = {
 			...theme.config,
 			startOnLoad: false,
 			securityLevel: "strict",
 		};
 		mermaid.initialize(config);
-		initializedThemeKey = theme.key;
+		initializedThemeKeys.set(mermaid, theme.key);
 	}
 	const id = `omp-mermaid-${renderSeq++}`;
 	let svg: string;
@@ -166,6 +193,11 @@ export interface MermaidBlockProps {
 	/** Mermaid diagram source. */
 	code: string;
 	className?: string;
+	/**
+	 * Loads the renderer; defaults to the lazily imported mermaid package.
+	 * Tests pass a stand-in, since mermaid needs a real layout engine.
+	 */
+	loadRenderer?: () => Promise<MermaidRenderer>;
 }
 
 interface RenderState {
@@ -174,7 +206,11 @@ interface RenderState {
 	failed: boolean;
 }
 
-export const MermaidBlock = memo(function MermaidBlock({ code, className }: MermaidBlockProps) {
+export const MermaidBlock = memo(function MermaidBlock({
+	code,
+	className,
+	loadRenderer = loadMermaid,
+}: MermaidBlockProps) {
 	const t = useT();
 	const theme = useMermaidTheme();
 	const cacheKey = `${theme.key}:${hashSource(code)}`;
@@ -192,7 +228,7 @@ export const MermaidBlock = memo(function MermaidBlock({ code, className }: Merm
 		}
 		setState({ key: cacheKey, svg: null, failed: false });
 		let cancelled = false;
-		renderDiagram(code, theme).then(
+		renderDiagram(code, theme, loadRenderer).then(
 			clean => {
 				if (!cancelled) setState({ key: cacheKey, svg: clean, failed: false });
 			},
@@ -203,7 +239,7 @@ export const MermaidBlock = memo(function MermaidBlock({ code, className }: Merm
 		return () => {
 			cancelled = true;
 		};
-	}, [code, theme, cacheKey]);
+	}, [code, theme, cacheKey, loadRenderer]);
 
 	// Guard against showing the previous diagram while the effect for a new
 	// (code, theme) pair has not run yet.

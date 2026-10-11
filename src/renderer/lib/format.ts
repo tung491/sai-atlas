@@ -180,6 +180,36 @@ export function escapeRegExp(s: string): string {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// The only entities escapeHtml and highlight.js emit; every other "&" in their
+// output is itself escaped, so decoding these five recovers the source text.
+const HTML_ENTITIES: Record<string, string> = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#x27;": "'" };
+
+/**
+ * Wraps case-insensitive literal matches of `pattern` in `<mark class="omp-hl">`
+ * inside HTML produced by escapeHtml or highlight.js. Matching runs on the
+ * decoded text between tags, so a pattern can split neither a tag nor an
+ * entity (searching `lt` must not hit `&lt;`), and every text run is
+ * re-escaped: the result adds `<mark>` elements and nothing else.
+ */
+export function markHtmlMatches(html: string, pattern: string): string {
+	if (!pattern) return html;
+	const re = new RegExp(escapeRegExp(pattern), "gi");
+	return html
+		.split(/(<[^>]*>)/)
+		.map((part, index) => {
+			if (index % 2 === 1) return part;
+			const text = part.replace(/&(?:amp|lt|gt|quot|#x27);/g, entity => HTML_ENTITIES[entity]);
+			let out = "";
+			let last = 0;
+			for (const match of text.matchAll(re)) {
+				out += `${escapeHtml(text.slice(last, match.index))}<mark class="omp-hl">${escapeHtml(match[0])}</mark>`;
+				last = match.index + match[0].length;
+			}
+			return out + escapeHtml(text.slice(last));
+		})
+		.join("");
+}
+
 export function basename(path: string | null | undefined): string {
 	if (!path) return "";
 	const parts = path.split(/[\\/]/);
