@@ -61,7 +61,6 @@ export function throwIfStopped(signal: AbortSignal | undefined): void {
 }
 
 export interface DocumentsEnv {
-	platform: NodeJS.Platform;
 	home: string;
 	/** Prints the XDG documents folder (`xdg-user-dir DOCUMENTS`); may throw. */
 	runXdgUserDir: () => string;
@@ -82,13 +81,12 @@ export function defaultRunXdgUserDir(): string {
 }
 
 /**
- * Documents > Sai ATLAS. On Linux the documents folder comes from `xdg-user-dir`,
+ * Documents > Sai ATLAS. The documents folder comes from `xdg-user-dir`,
  * which prints the home folder itself when no documents folder is configured;
  * that, an empty answer or a failure falls back to `~/Documents`.
  */
 export function documentsDir(env: DocumentsEnv): string {
 	const fallback = join(env.home, "Documents", OUTPUT_FOLDER);
-	if (env.platform !== "linux") return fallback;
 	let printed: string;
 	try {
 		printed = env.runXdgUserDir().trim();

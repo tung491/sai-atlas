@@ -29,7 +29,6 @@ import {
 
 export interface OfficeEnv {
 	home: string;
-	platform: NodeJS.Platform;
 	runXdgUserDir: () => string;
 	/** `SAI_ATLAS_LANG`: picks the decimal mark, the checks and the default file names; English unless `vi`. */
 	lang: string;
@@ -40,7 +39,6 @@ export interface OfficeEnv {
 export function defaultOfficeEnv(): OfficeEnv {
 	return {
 		home: process.env.HOME || homedir(),
-		platform: process.platform,
 		runXdgUserDir: defaultRunXdgUserDir,
 		lang: process.env.SAI_ATLAS_LANG === "vi" ? "vi" : "en",
 	};

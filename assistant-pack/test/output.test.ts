@@ -34,13 +34,12 @@ afterEach(() => {
 
 describe("documentsDir", () => {
 	it("uses the folder xdg-user-dir names on Linux", () => {
-		const dir = documentsDir({ platform: "linux", home: "/home/u", runXdgUserDir: () => "/home/u/Tài liệu\n" });
+		const dir = documentsDir({ home: "/home/u", runXdgUserDir: () => "/home/u/Tài liệu\n" });
 		expect(dir).toBe("/home/u/Tài liệu/Sai ATLAS");
 	});
 
 	it("falls back to ~/Documents when xdg-user-dir throws", () => {
 		const dir = documentsDir({
-			platform: "linux",
 			home: "/home/u",
 			runXdgUserDir: () => {
 				throw new Error("xdg-user-dir: not found");
@@ -50,24 +49,12 @@ describe("documentsDir", () => {
 	});
 
 	it("falls back to ~/Documents when xdg-user-dir prints an empty line", () => {
-		expect(documentsDir({ platform: "linux", home: "/home/u", runXdgUserDir: () => "\n" })).toBe(
-			"/home/u/Documents/Sai ATLAS",
-		);
+		expect(documentsDir({ home: "/home/u", runXdgUserDir: () => "\n" })).toBe("/home/u/Documents/Sai ATLAS");
 	});
 
 	it("falls back to ~/Documents when xdg-user-dir prints the home folder itself", () => {
-		expect(documentsDir({ platform: "linux", home: "/home/u", runXdgUserDir: () => "/home/u\n" })).toBe(
-			"/home/u/Documents/Sai ATLAS",
-		);
-		expect(documentsDir({ platform: "linux", home: "/home/u", runXdgUserDir: () => "/home/u/\n" })).toBe(
-			"/home/u/Documents/Sai ATLAS",
-		);
-	});
-
-	it("uses ~/Documents on macOS", () => {
-		expect(documentsDir({ platform: "darwin", home: "/Users/u", runXdgUserDir: () => "/elsewhere" })).toBe(
-			"/Users/u/Documents/Sai ATLAS",
-		);
+		expect(documentsDir({ home: "/home/u", runXdgUserDir: () => "/home/u\n" })).toBe("/home/u/Documents/Sai ATLAS");
+		expect(documentsDir({ home: "/home/u", runXdgUserDir: () => "/home/u/\n" })).toBe("/home/u/Documents/Sai ATLAS");
 	});
 });
 

@@ -95,11 +95,12 @@ describe("assistant pack", () => {
 		const fixture = join(root, "e2e", "sidecar-fixture.ts");
 		writeFile(fixture);
 		writePack(join(root, "resources", "assistant-pack"), PACK_FILES);
-		const appPath = join(root, "out", "main");
-		mkdirSync(appPath, { recursive: true });
+		// The Tauri shell's dev and e2e search root: its manifest directory.
+		const manifestDir = join(root, "src-tauri");
+		mkdirSync(manifestDir, { recursive: true });
 
 		// The search walks up from each root, as the bundled-binary lookup does.
-		expect(resolveAssistantPackDir(fixture, [appPath])).toBe(join(root, "resources", "assistant-pack"));
+		expect(resolveAssistantPackDir(fixture, [manifestDir])).toBe(join(root, "resources", "assistant-pack"));
 		// Without search roots, or when no root holds a pack, the beside-binary
 		// path comes back so the missing-file message can name it.
 		expect(resolveAssistantPackDir(fixture)).toBe(join(root, "e2e", "assistant-pack"));
@@ -110,16 +111,17 @@ describe("assistant pack", () => {
 	it("resolves the pack from the search roots when the sidecar runs from source", () => {
 		const root = tempRoot();
 		writePack(join(root, "resources", "assistant-pack"), PACK_FILES);
-		const appPath = join(root, "out", "main");
-		mkdirSync(appPath, { recursive: true });
-		// The main process's cwd holds a pack-shaped folder, as the repo root holds the pack source.
+		// The Tauri shell's dev and e2e search root: its manifest directory.
+		const manifestDir = join(root, "src-tauri");
+		mkdirSync(manifestDir, { recursive: true });
+		// The process's cwd holds a pack-shaped folder, as the repo root holds the pack source.
 		const cwd = tempRoot();
 		writePack(join(cwd, "assistant-pack"), PACK_FILES);
 		const previous = process.cwd();
 		process.chdir(cwd);
 		try {
 			// A source sidecar has no binary path: nothing sits beside it, so the search roots decide.
-			expect(resolveAssistantPackDir("", [appPath])).toBe(join(root, "resources", "assistant-pack"));
+			expect(resolveAssistantPackDir("", [manifestDir])).toBe(join(root, "resources", "assistant-pack"));
 			// The result is always absolute: omp would resolve a relative flag path against the session cwd.
 			const unfound = resolveAssistantPackDir("", ["nowhere"]);
 			expect(isAbsolute(unfound)).toBe(true);

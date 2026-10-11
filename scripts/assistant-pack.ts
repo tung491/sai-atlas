@@ -2,8 +2,9 @@
  * The assistant pack every sidecar session loads: where it lives, the files it
  * must hold, and the spawn flags and env that load it.
  *
- * Imports only `node:path` and `node:fs`: the Bun pack check script
- * (`scripts/check-assistant-pack.ts`) loads this module as well as the main process.
+ * The pack check script (`scripts/check-assistant-pack.ts`) loads this module;
+ * the Tauri shell spawns sessions from its Rust mirror,
+ * `src-tauri/src/omp/assistant_pack.rs`, which must agree with it.
  */
 import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";

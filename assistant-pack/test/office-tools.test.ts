@@ -23,7 +23,7 @@ let outDir: string;
 beforeEach(() => {
 	home = mkdtempSync(join(tmpdir(), "sai-atlas-home-"));
 	// An installed xdg-user-dir prints the home folder when no documents folder is configured.
-	env = { home, platform: "linux", runXdgUserDir: () => `${home}\n`, lang: "en" };
+	env = { home, runXdgUserDir: () => `${home}\n`, lang: "en" };
 	outDir = join(home, "Documents", "Sai ATLAS");
 });
 
