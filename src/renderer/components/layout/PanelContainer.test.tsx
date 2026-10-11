@@ -83,7 +83,6 @@ function seedActiveTab(kind: "agent" | "chat"): void {
 	useTabsStore.setState({
 		tabs: [{ id: "t0", cwd: "/work", status: "ready", kind, unreadDone: false }],
 		activeTabId: "t0",
-		bundles: new Map(),
 	});
 }
 
@@ -300,7 +299,6 @@ function seedSplitTabs(): void {
 			{ id: "t1", cwd: "/other", status: "ready", kind: "agent", unreadDone: false },
 		],
 		activeTabId: "t0",
-		bundles: new Map(),
 		split: { axis: "columns", firstTabId: "t0", secondTabId: "t1", ratio: 0.5 },
 	});
 }

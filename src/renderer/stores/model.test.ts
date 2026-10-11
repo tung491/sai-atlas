@@ -77,6 +77,28 @@ describe("model store catalog", () => {
 		expect(store.getState().providers.map(row => row.id)).toEqual(["ollama"]);
 		expect(store.getState().catalogGeneration).toBe(4);
 	});
+
+	it("drops a read reply older than the catalog push already applied", async () => {
+		const reply = Promise.withResolvers<RpcResponse>();
+		const store = createModelStore(() => reply.promise);
+		const read = store.getState().refreshAvailableModels();
+
+		store.getState().applyCatalogUpdate({
+			type: "model_catalog_update",
+			models: [{ provider: "ollama", id: "qwen3:8b" }],
+			generation: 5,
+		} as ModelCatalogUpdateFrame);
+		reply.resolve({
+			type: "response",
+			command: "get_available_models",
+			success: true,
+			data: { models: [{ provider: "ollama", id: "gemma3:4b" }], generation: 3 },
+		});
+		await read;
+
+		expect(ids(store.getState().availableModels)).toEqual(["ollama/qwen3:8b"]);
+		expect(store.getState().catalogGeneration).toBe(5);
+	});
 });
 
 describe("model store local-only guard", () => {
@@ -173,6 +195,20 @@ describe("model store local-only guard", () => {
 		expect(useToastStore.getState().toasts.some(toast => toast.variant === "error")).toBe(true);
 	});
 
+	it("forgets the last local model on reset", async () => {
+		const { calls, command } = sidecar();
+		const store = createModelStore(command);
+		store.setState({ model: local });
+		await store.getState().enforceLocalModel();
+
+		store.getState().reset();
+		store.setState({ model: { provider: "anthropic", id: "claude-sonnet-4-5" }, availableModels: [other] });
+		await store.getState().enforceLocalModel();
+
+		expect(calls).toEqual([{ type: "set_model", provider: "ollama", modelId: "qwen3:8b" }]);
+		expect(store.getState().model).toEqual(other);
+	});
+
 	it("switches back once while a refusal is in flight", async () => {
 		const { calls, command, release } = sidecar({ hold: true });
 		const store = createModelStore(command);
@@ -186,7 +222,8 @@ describe("model store local-only guard", () => {
 		await Promise.all([first, second]);
 
 		expect(calls).toHaveLength(1);
-		expect(warnings()).toHaveLength(1);
+		// `count` stays 1: a second refusal toast would be coalesced into the first.
+		expect(warnings()).toMatchObject([{ count: 1 }]);
 		expect(store.getState().model).toEqual(local);
 	});
 });

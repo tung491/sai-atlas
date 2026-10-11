@@ -47,15 +47,66 @@ afterEach(async () => {
 });
 
 describe("UpdateBanner", () => {
-	it("retains restart-and-install for certificate-backed automatic updates", async () => {
+	it("offers a download for an available version the user has not dismissed", async () => {
+		useUpdaterStore.setState({
+			status: { state: "available", version: "0.9.20", mode: "automatic" },
+			dismissed: { version: "0.9.19" },
+		});
+		await mount(<UpdateBanner />);
+
+		expect(container.textContent).toContain("Version 0.9.20 is available");
+		const downloadButton = container
+			.querySelectorAll("button")
+			.find(button => button.textContent?.includes("Download update"));
+		await act(async () => {
+			downloadButton?.click();
+		});
+		expect(download).toHaveBeenCalledOnce();
+	});
+
+	it("hides the version the user dismissed", async () => {
+		useUpdaterStore.setState({
+			status: { state: "available", version: "0.9.20", mode: "automatic" },
+			dismissed: { version: "0.9.20" },
+		});
+		await mount(<UpdateBanner />);
+
+		expect(container.textContent).toBe("");
+	});
+
+	it("shows download progress", async () => {
+		useUpdaterStore.setState({
+			status: {
+				state: "downloading",
+				version: "0.9.20",
+				mode: "automatic",
+				percent: 42,
+				bytesPerSecond: 1_000,
+				transferred: 42_000_000,
+				total: 100_000_000,
+			},
+			dismissed: { version: "0.9.20" },
+		});
+		await mount(<UpdateBanner />);
+
+		expect(container.textContent).toContain("Downloading update…");
+		expect(container.textContent).toContain("42% · 42.0 MB/100.0 MB");
+	});
+
+	it("offers restart-and-install once the update is downloaded", async () => {
 		useUpdaterStore.setState({
 			status: { state: "downloaded", version: "0.8.5", mode: "automatic" },
 			dismissed: {},
 		});
 		await mount(<UpdateBanner />);
 
-		expect(container.textContent).toContain("Restart & install");
-		expect(container.textContent).not.toMatch(/Finder|DMG/i);
+		const restartButton = container
+			.querySelectorAll("button")
+			.find(button => button.textContent?.includes("Restart & install"));
+		await act(async () => {
+			restartButton?.click();
+		});
+		expect(apply).toHaveBeenCalledOnce();
 	});
 
 	it("asks for a reopen instead of offering an install that cannot ask for administrator access", async () => {

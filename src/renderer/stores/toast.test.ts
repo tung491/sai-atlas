@@ -34,3 +34,25 @@ describe("toast dedupe", () => {
 		expect(useToastStore.getState().toasts).toHaveLength(2);
 	});
 });
+
+describe("toast stack", () => {
+	it("keeps only the 8 newest toasts", () => {
+		for (let index = 1; index <= 9; index++) useToastStore.getState().push({ message: `notice ${index}` });
+
+		const messages = useToastStore.getState().toasts.map(toast => toast.message);
+		expect(messages).toHaveLength(8);
+		expect(messages[0]).toBe("notice 2");
+		expect(messages.at(-1)).toBe("notice 9");
+	});
+
+	it("starts the exit of only the dismissed toast", () => {
+		const keptId = useToastStore.getState().push({ message: "kept" });
+		const dismissedId = useToastStore.getState().push({ message: "dismissed" });
+
+		useToastStore.getState().dismiss(dismissedId);
+
+		const toasts = useToastStore.getState().toasts;
+		expect(toasts.find(toast => toast.id === dismissedId)?.exitingAt).toEqual(expect.any(Number));
+		expect(toasts.find(toast => toast.id === keptId)?.exitingAt).toBeUndefined();
+	});
+});

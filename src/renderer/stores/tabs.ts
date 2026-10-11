@@ -33,12 +33,6 @@ import { sessionDisplayTitle } from "../lib/session-title";
 import { beginTabRoute, reconcileTabRoute, resetTabRoute, settleTabRoute } from "../lib/tab-routing";
 import { type ComposerDocument, type ComposerImage, type ComposerStore, useComposerStore } from "./composer";
 import type { ExtensionUiStore } from "./extension-ui";
-import {
-	type PendingPlanProposal,
-	type PlanApprovalStore,
-	type PlanApprovalSubmitState,
-	usePlanApprovalStore,
-} from "./plan-approval";
 import { type SessionStore, useSessionStore } from "./session";
 import {
 	deleteSessionRuntime,
@@ -214,8 +208,6 @@ export type OpenTabFailure = "cap" | "error" | "kind-mismatch";
 export interface TabsStore {
 	tabs: SessionTab[];
 	activeTabId: string | null;
-	/** Deprecated compatibility field for older test/setup call sites. Runtime state is no longer bundled. */
-	bundles: Map<unknown, unknown>;
 	split: SplitLayout | null;
 	/** Boot reconciliation with the main-process pool: the window's initial
 	 * sidecar arrives as tab 0 and must never be duplicated — entries merge by
@@ -347,7 +339,6 @@ async function reconcileWithMain(
 export const useTabsStore = create<TabsStore>()((set, get) => ({
 	tabs: [],
 	activeTabId: null,
-	bundles: new Map(),
 	split: null,
 	reconciled: false,
 
@@ -693,7 +684,7 @@ export const useTabsStore = create<TabsStore>()((set, get) => ({
 		closedTabIds.clear();
 		setFocusedSessionRuntime(null);
 		resetTabRoute();
-		set({ tabs: [], activeTabId: null, bundles: new Map(), split: null, reconciled: false });
+		set({ tabs: [], activeTabId: null, split: null, reconciled: false });
 	},
 }));
 
@@ -738,52 +729,6 @@ export function restoreTabComposer(
 	}
 	if (originComposer ? composer !== originComposer : session.getState().sessionId !== sessionId) return;
 	composer.setState(restore);
-}
-
-/** Finish a plan-approval request in the tab that issued it. The response may
- * arrive after the user switched elsewhere, so both the proposal UI and the
- * plan-mode flag are updated in that tab's parked bundle instead of whichever
- * session happens to be visible. */
-export function settleTabPlanApproval(
-	tabId: string | null,
-	sessionId: string,
-	target: PendingPlanProposal,
-	result: {
-		clear?: boolean;
-		notice?: string | null;
-		submitting?: PlanApprovalSubmitState | null;
-		exitPlanMode?: boolean;
-	},
-): void {
-	const resolvedTabId = tabId ?? useTabsStore.getState().activeTabId;
-	const session = sessionRuntimeStore<SessionStore>(resolvedTabId, "session");
-	const planStore = sessionRuntimeStore<PlanApprovalStore>(resolvedTabId, "planApproval");
-	if (!session || !planStore) {
-		if (
-			useTabsStore.getState().activeTabId !== resolvedTabId ||
-			useSessionStore.getState().sessionId !== sessionId ||
-			usePlanApprovalStore.getState().pending !== target
-		)
-			return;
-		usePlanApprovalStore.setState(state => ({
-			pending: result.clear ? null : target,
-			feedback: result.clear ? "" : state.feedback,
-			notice: result.clear ? null : result.notice === undefined ? state.notice : result.notice,
-			submitting: result.clear ? null : result.submitting === undefined ? state.submitting : result.submitting,
-		}));
-		if (result.exitPlanMode) useSessionStore.setState({ planModeEnabled: false });
-		return;
-	}
-	if (session.getState().sessionId !== sessionId) return;
-	const plan = planStore.getState();
-	if (plan.pending !== target) return;
-	planStore.setState({
-		pending: result.clear ? null : target,
-		feedback: result.clear ? "" : plan.feedback,
-		notice: result.clear ? null : result.notice === undefined ? plan.notice : result.notice,
-		submitting: result.clear ? null : result.submitting === undefined ? plan.submitting : result.submitting,
-	});
-	if (result.exitPlanMode) session.setState({ planModeEnabled: false });
 }
 
 /**

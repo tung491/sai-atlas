@@ -125,29 +125,30 @@ describe("scoped store subscribe", () => {
 	});
 });
 
-it("rejects late snapshots after an in-place session replacement and tab closure", async () => {
+it("rejects a late snapshot after an in-place session replacement", async () => {
 	const runtime = createTabRuntime("tab-a");
 	const state = sessionRuntimeStore<SessionStore>("tab-a", "session")!;
 	state.setState({ sessionId: "old-session" });
-	const first = Promise.withResolvers<RpcResponse>();
-	const second = Promise.withResolvers<RpcResponse>();
-	const spy = vi
-		.spyOn(window.omp.rpc, "commandForTab")
-		.mockReturnValueOnce(first.promise)
-		.mockReturnValueOnce(second.promise);
-	try {
-		const old = runtime.command({ type: "get_settings" });
-		state.setState({ sessionId: "replacement" });
-		first.resolve({ type: "response", command: "get_settings", success: true, data: { values: { old: true } } });
-		expect(await old).toMatchObject({ success: false });
-		const closing = runtime.command({ type: "get_state" });
-		deleteSessionRuntime("tab-a");
-		second.resolve({ type: "response", command: "get_state", success: true, data: {} });
-		expect(await closing).toMatchObject({ success: false });
-		expect(state.getState().sessionId).toBe("replacement");
-	} finally {
-		spy.mockRestore();
-	}
+	const reply = Promise.withResolvers<RpcResponse>();
+	vi.spyOn(window.omp.rpc, "commandForTab").mockReturnValueOnce(reply.promise);
+
+	const old = runtime.command({ type: "get_settings" });
+	state.setState({ sessionId: "replacement" });
+	reply.resolve({ type: "response", command: "get_settings", success: true, data: { values: { old: true } } });
+
+	expect(await old).toMatchObject({ success: false, code: "rpc_delivery_unknown" });
+});
+
+it("rejects a late snapshot for a tab closed before it had a session id", async () => {
+	const runtime = createTabRuntime("tab-a");
+	const reply = Promise.withResolvers<RpcResponse>();
+	vi.spyOn(window.omp.rpc, "commandForTab").mockReturnValueOnce(reply.promise);
+
+	const closing = runtime.command({ type: "get_state" });
+	deleteSessionRuntime("tab-a");
+	reply.resolve({ type: "response", command: "get_state", success: true, data: {} });
+
+	expect(await closing).toMatchObject({ success: false, code: "rpc_delivery_unknown" });
 });
 
 it("does not deliver an old view's command to the replacement session", async () => {

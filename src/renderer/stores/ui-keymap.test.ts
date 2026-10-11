@@ -47,12 +47,16 @@ describe("ui store keymap overrides", () => {
 		await useUiStore.getState().hydrateKeymap();
 		await useUiStore.getState().hydrateKeymap();
 		expect(prefs.get).toHaveBeenCalledTimes(1);
-		(globalThis as Record<string, unknown>).window = {
-			omp: { prefs: { get: vi.fn(async () => Promise.reject(new Error("no ipc"))) } },
-		};
-		useUiStore.setState({ keymapOverrides: {}, keymapHydrated: false });
+
+		const failingGet = vi.fn(async () => Promise.reject(new Error("no ipc")));
+		(globalThis as Record<string, unknown>).window = { omp: { prefs: { get: failingGet } } };
+		useUiStore.setState({ keymapOverrides: { retry: ["⌥⇧R"] }, keymapHydrated: false });
 		await useUiStore.getState().hydrateKeymap();
-		expect(useUiStore.getState().keymapOverrides).toEqual({});
+		await useUiStore.getState().hydrateKeymap();
+		// The failed read counts as hydrated: current overrides stay and the IPC is not retried.
+		expect(useUiStore.getState().keymapOverrides).toEqual({ retry: ["⌥⇧R"] });
+		expect(useUiStore.getState().keymapHydrated).toBe(true);
+		expect(failingGet).toHaveBeenCalledTimes(1);
 	});
 
 	it("persists every mutation and survives a simulated reload", async () => {

@@ -248,7 +248,6 @@ function seedStores(): void {
 	useTabsStore.setState({
 		tabs: [{ id: "t0", cwd: "/work/alpha", status: "ready", kind: "agent", unreadDone: false }],
 		activeTabId: "t0",
-		bundles: new Map(),
 	});
 }
 
@@ -287,7 +286,6 @@ describe("Sidebar menus and pinned ordering", () => {
 		useTabsStore.setState({
 			tabs: [{ id: "chat", cwd: "/neutral", status: "ready", kind: "chat", unreadDone: false }],
 			activeTabId: "chat",
-			bundles: new Map(),
 		});
 		useSidebarPrefs.setState({ hydrated: true });
 		await mount(<SidebarWithRecency />);
@@ -322,7 +320,6 @@ describe("Sidebar menus and pinned ordering", () => {
 		useTabsStore.setState({
 			tabs: [{ id: "chat", cwd: "/work/alpha", status: "ready", kind: "chat", unreadDone: false }],
 			activeTabId: "chat",
-			bundles: new Map(),
 		});
 		await mount(<Sidebar />);
 

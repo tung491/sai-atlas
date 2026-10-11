@@ -103,7 +103,7 @@ async function syncApprovalMode(
 }
 
 /** Setting path → store field for the boolean display keys synced below. */
-const DISPLAY_BOOL_MAP: Record<
+export const DISPLAY_BOOL_MAP: Record<
 	string,
 	| "hideThinkingBlock"
 	| "proseOnlyThinking"
@@ -131,8 +131,8 @@ const DISPLAY_BOOL_MAP: Record<
 };
 const DISPLAY_SYNC_KEYS = Object.keys(DISPLAY_BOOL_MAP);
 
-/** Setting path → store field for numeric display keys. */
-const DISPLAY_NUM_MAP: Record<string, "pasteMenuThreshold"> = {
+/** Setting path → store field for numeric display keys (finite, non-negative counts). */
+export const DISPLAY_NUM_MAP: Record<string, "pasteMenuThreshold"> = {
 	"paste.largeMenuThreshold": "pasteMenuThreshold",
 };
 const DISPLAY_NUM_KEYS = Object.keys(DISPLAY_NUM_MAP);
@@ -159,7 +159,7 @@ async function syncDisplaySettings(
 			}
 			for (const [path, field] of Object.entries(DISPLAY_NUM_MAP)) {
 				const value = values?.[path];
-				if (typeof value === "number") partial[field] = value;
+				if (typeof value === "number" && Number.isFinite(value) && value >= 0) partial[field] = value;
 			}
 			if (Object.keys(partial).length > 0) set(partial);
 		}

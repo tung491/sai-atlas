@@ -80,7 +80,6 @@ async function mount({ isStreaming = false } = {}): Promise<void> {
 	useTabsStore.setState({
 		tabs: [{ kind: "agent", id: "t0", cwd: "/tmp", status: "ready", unreadDone: false }],
 		activeTabId: "t0",
-		bundles: new Map(),
 	});
 	container = document.createElement("div") as unknown as Element;
 	document.body.appendChild(container as never);

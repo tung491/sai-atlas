@@ -5,6 +5,7 @@
  * is replaced wholesale (the main process owns the machine).
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { UpdateStatus } from "../../shared/ipc-types";
 import { loadDismissal, useUpdaterStore } from "./updater";
 
 const globals = globalThis as Record<string, unknown>;
@@ -48,16 +49,6 @@ describe("useUpdaterStore", () => {
 		expect(useUpdaterStore.getState().status).toEqual({ state: "downloaded", version: "0.4.1", mode: "automatic" });
 	});
 
-	it("dismisses per version: a newer version is not covered by an older dismissal", () => {
-		const { dismiss, setStatus } = useUpdaterStore.getState();
-		dismiss("0.4.1");
-		expect(useUpdaterStore.getState().dismissed.version).toBe("0.4.1");
-		// The banner hides only when dismissed.version === status.version; a newer
-		// available version must compare unequal.
-		setStatus({ state: "available", version: "0.4.2", mode: "automatic" });
-		expect(useUpdaterStore.getState().dismissed.version).not.toBe("0.4.2");
-	});
-
 	it("hands a dismissal to the next process through the same key it reads back", () => {
 		const { dismiss, dismissError } = useUpdaterStore.getState();
 		dismiss("0.4.1");
@@ -74,12 +65,17 @@ describe("useUpdaterStore", () => {
 		expect(useUpdaterStore.getState().dismissed.error).toBe(true);
 	});
 
-	it("re-arms the failure banner once a check proves the updater works", () => {
-		const { dismissError, setStatus } = useUpdaterStore.getState();
+	it.each([
+		{ state: "not-available", version: "0.4.1" },
+		{ state: "available", version: "0.4.2", mode: "automatic" },
+		{ state: "downloaded", version: "0.4.2", mode: "automatic" },
+	] satisfies UpdateStatus[])("re-arms the failure banner once a check reports $state", status => {
+		const { dismiss, dismissError, setStatus } = useUpdaterStore.getState();
+		dismiss("0.4.0");
 		dismissError();
-		setStatus({ state: "not-available", version: "0.4.1" });
-		expect(useUpdaterStore.getState().dismissed.error).toBeUndefined();
-		expect(loadDismissal().error).toBeUndefined();
+		setStatus(status);
+		expect(useUpdaterStore.getState().dismissed).toEqual({ version: "0.4.0" });
+		expect(loadDismissal()).toEqual({ version: "0.4.0" });
 	});
 
 	it("refuses a persisted blob it cannot trust", () => {

@@ -186,7 +186,6 @@ async function mount(withRuntime = false): Promise<void> {
 			{ kind: "agent", id: "t1", cwd: "/other", status: "ready", unreadDone: false },
 		],
 		activeTabId: "t0",
-		bundles: new Map(),
 	});
 	const runtime = withRuntime ? createTabRuntime("t0") : null;
 	if (runtime) {

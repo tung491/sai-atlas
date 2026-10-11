@@ -37,7 +37,6 @@ import { acceptsActiveTabEvents } from "../lib/tab-routing";
 import { useExtensionUiStore } from "../stores/extension-ui";
 import { useMessagesStore } from "../stores/messages";
 import { useModelStore } from "../stores/model";
-import { usePlanApprovalStore } from "../stores/plan-approval";
 import { useQueueStore } from "../stores/queue";
 import { type SessionStore, useSessionStore } from "../stores/session";
 import {
@@ -597,7 +596,6 @@ export function useRpcEvents(heartbeatMs = 15_000): void {
 					useTodoStore.getState().reset();
 					useToolsStore.getState().reset();
 					useExtensionUiStore.getState().clearAll();
-					usePlanApprovalStore.getState().clearProposal();
 				});
 				if (isFocused()) useUiStore.getState().clearSidecarError();
 			}

@@ -188,6 +188,12 @@ async function mount(element: ReactElement): Promise<void> {
 
 /** Drive an element's React onClick (linkedom has no synthetic event system). */
 async function click(element: TestElement): Promise<void> {
+	await clickWithoutFlush(element);
+	await flush();
+}
+
+/** `click` without the timer-based flush, for tests running on fake timers. */
+async function clickWithoutFlush(element: TestElement): Promise<void> {
 	const record = element as unknown as Record<string, unknown>;
 	const propsKey = Object.getOwnPropertyNames(record).find(key => key.startsWith("__reactProps$"));
 	const props = propsKey
@@ -197,7 +203,6 @@ async function click(element: TestElement): Promise<void> {
 		: undefined;
 	if (!props?.onClick) throw new Error("element onClick not found");
 	await act(async () => props.onClick?.({ stopPropagation: () => {}, preventDefault: () => {} }));
-	await flush();
 }
 
 /** Drive an element's React onContextMenu (linkedom has no synthetic event system). */
@@ -290,7 +295,6 @@ describe("TabBar", () => {
 				},
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 
 		await mount(<TabBar />);
@@ -327,7 +331,6 @@ describe("TabBar", () => {
 				},
 			],
 			activeTabId: "t-real",
-			bundles: new Map(),
 		});
 
 		await mount(<TabBar />);
@@ -364,7 +367,6 @@ describe("TabBar", () => {
 				},
 			],
 			activeTabId: "t-empty",
-			bundles: new Map(),
 		});
 		useComposerStore.getState().setDraft("do not lose this");
 
@@ -382,7 +384,6 @@ describe("TabBar", () => {
 				{ kind: "agent", id: "t1", cwd: "/work/beta", status: "ready", unreadDone: false },
 			],
 			activeTabId: "t1",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -410,7 +411,6 @@ describe("TabBar", () => {
 				{ kind: "agent", id: "t1", cwd: "/work/beta", status: "ready", title: "Short", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -441,7 +441,6 @@ describe("TabBar", () => {
 		useTabsStore.setState({
 			tabs: [{ kind: "agent", id: "t0", cwd: "/alpha", status: "ready", unreadDone: false }],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 		expect(container.querySelectorAll('[role="tab"] button')).toHaveLength(0);
@@ -463,7 +462,6 @@ describe("TabBar", () => {
 				{ kind: "agent", id: "t1", cwd: "/beta", status: "ready", unreadDone: true },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -486,7 +484,6 @@ describe("TabBar", () => {
 			],
 			activeTabId: "t0",
 			split: null,
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -518,7 +515,6 @@ describe("TabBar", () => {
 				{ kind: "agent", id: "t3", cwd: "/delta", status: "ready", unreadDone: false },
 			],
 			activeTabId: "t2",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -548,7 +544,6 @@ describe("TabBar", () => {
 				{ kind: "agent", id: "t1", cwd: "/beta", status: "ready", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		// Hydrate on the switch pulls the target sidecar's state — its cwd is
 		// what the + button reuses for the fresh tab.
@@ -584,7 +579,6 @@ describe("TabBar", () => {
 		useTabsStore.setState({
 			tabs: [{ kind: "agent", id: "t0", cwd: "/beta", status: "ready", unreadDone: false }],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		useSessionStore.setState({ cwd: "/beta" });
 		await mount(<TabBar />);
@@ -599,7 +593,6 @@ describe("TabBar", () => {
 		useTabsStore.setState({
 			tabs: [{ kind: "agent", id: "t0", cwd: "/beta", status: "ready", unreadDone: false }],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -617,7 +610,6 @@ describe("TabBar", () => {
 				{ kind: "agent", id: "t1", cwd: "/beta", status: "ready", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -633,12 +625,6 @@ describe("TabBar", () => {
 });
 
 describe("TabBar close confirm", () => {
-	const sleep = (ms: number) => {
-		const { promise, resolve } = Promise.withResolvers<void>();
-		setTimeout(resolve, ms);
-		return promise;
-	};
-
 	function seedRunning(): void {
 		useTabsStore.setState({
 			tabs: [
@@ -646,7 +632,6 @@ describe("TabBar close confirm", () => {
 				{ kind: "agent", id: "t1", cwd: "/beta", status: "running", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 	}
 
@@ -682,20 +667,31 @@ describe("TabBar close confirm", () => {
 	});
 
 	it("the armed close auto-cancels after the timeout", async () => {
-		// Real timers + a short injected window (bun-test compatible).
 		seedRunning();
-		await mount(<TabBar confirmCloseMs={25} />);
+		await mount(<TabBar confirmCloseMs={5_000} />);
+		// Fake timers from the arm on: the window is exact under any suite load.
+		// Only the synchronous vi.advanceTimersByTime is used, which bun test
+		// also implements.
+		vi.useFakeTimers();
+		try {
+			await clickWithoutFlush(chips()[1]!.querySelector('[aria-label="Close tab"]')!);
+			const advance = async (ms: number) => {
+				await act(async () => {
+					vi.advanceTimersByTime(ms);
+				});
+			};
 
-		await click(chips()[1]!.querySelector('[aria-label="Close tab"]')!);
-		expect(chips()[1]?.textContent).toContain("Close tab? The running task will be aborted");
+			await advance(4_999);
+			expect(chips()[1]?.textContent).toContain("Close tab? The running task will be aborted");
+			expect(chips()[1]?.querySelector('[aria-label="Confirm"]')).not.toBeNull();
 
-		await act(async () => {
-			await sleep(60);
-		});
-
-		expect(omp.tabs.close).not.toHaveBeenCalled();
-		expect(chips()[1]?.querySelector('[aria-label="Confirm"]')).toBeNull();
-		expect(chips()[1]?.querySelector('[aria-label="Close tab"]')).not.toBeNull();
+			await advance(1);
+			expect(omp.tabs.close).not.toHaveBeenCalled();
+			expect(chips()[1]?.querySelector('[aria-label="Confirm"]')).toBeNull();
+			expect(chips()[1]?.querySelector('[aria-label="Close tab"]')).not.toBeNull();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("a starting tab arms, and so does the active tab's live stream", async () => {
@@ -705,7 +701,6 @@ describe("TabBar close confirm", () => {
 				{ kind: "agent", id: "t1", cwd: "/beta", status: "starting", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -730,7 +725,6 @@ describe("TabBar close confirm", () => {
 				{ kind: "agent", id: "t1", cwd: "/beta", status: "ready", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -747,7 +741,6 @@ describe("TabBar close confirm", () => {
 				{ kind: "agent", id: "t1", cwd: "/beta", status: "ready", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -779,7 +772,6 @@ describe("TabBar close confirm", () => {
 				},
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -802,7 +794,6 @@ describe("TabBar chip labels (F-HYDRATE)", () => {
 				{ kind: "agent", id: "t2", cwd: "/tmp/gui", status: "ready", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -820,7 +811,6 @@ describe("TabBar chip labels (F-HYDRATE)", () => {
 				{ kind: "agent", id: "t1", cwd: "/other/gui", status: "ready", title: "Release plan", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -835,7 +825,6 @@ describe("TabBar chip labels (F-HYDRATE)", () => {
 				{ kind: "agent", id: "t1", cwd: "/other/gui", status: "ready", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 		expect(tabTitles()).toEqual(["gui", "gui #2"]);
@@ -853,7 +842,6 @@ describe("TabBar chip labels (F-HYDRATE)", () => {
 		useTabsStore.setState({
 			tabs: [{ kind: "agent", id: "t0", cwd: "/work/infron", status: "ready", unreadDone: false }],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 
@@ -864,7 +852,6 @@ describe("TabBar chip labels (F-HYDRATE)", () => {
 		useTabsStore.setState({
 			tabs: [{ kind: "agent", id: "t0", cwd: "/work/gui", status: "ready", unreadDone: false }],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount(<TabBar />);
 

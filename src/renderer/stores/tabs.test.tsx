@@ -1,10 +1,12 @@
 /**
  * tabs store contract tests:
- * - boot GET_TABS reconciliation (initial sidecar = tab 0, never duplicated)
- * - switchTab snapshots the current tab's session-scoped slices (messages,
- *   session meta, todos, subagents, queue, model, composer draft), restores
- *   the target's bundle for instant paint, fires SET_ACTIVE_TAB BEFORE
- *   hydrate, then hydrates from the target sidecar
+ * - boot GET_TABS reconciliation (initial sidecar = tab 0, never duplicated),
+ *   including a split restored from main
+ * - switchTab re-points the focused runtime at the target tab, whose
+ *   session-scoped slices (messages, session meta, todos, subagents, queue,
+ *   model, composer draft) stay in its own runtime and paint instantly; it
+ *   fires SET_ACTIVE_TAB BEFORE hydrate, then hydrates from the target sidecar
+ * - split panes route through SET_TAB_VIEW, with a clamped, debounced ratio
  * - closeTab keeps ≥1 tab and activates a neighbor when the active tab closes
  * - applyTabStatus stamps unreadDone on background run completion
  * - useSessionTabs completes the open-in-new-tab flow (pending session path
@@ -18,7 +20,15 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, type Mock, vi } from "vitest";
-import type { IpcSpawnTabPayload, IpcSpawnTabResult, IpcTabInfo, IpcTabStatusPayload } from "../../shared/ipc-types";
+import type {
+	IpcSessionOpenNewWindowPayload,
+	IpcSessionOpenNewWindowResult,
+	IpcSetTabViewPayload,
+	IpcSpawnTabPayload,
+	IpcSpawnTabResult,
+	IpcTabInfo,
+	IpcTabStatusPayload,
+} from "../../shared/ipc-types";
 import type {
 	AgentMessage,
 	ModelInfo,
@@ -32,7 +42,6 @@ import { useComposerStore } from "./composer";
 import { useExtensionUiStore } from "./extension-ui";
 import { useMessagesStore } from "./messages";
 import { useModelStore } from "./model";
-import { usePlanApprovalStore } from "./plan-approval";
 import { useQueueStore } from "./queue";
 import { useSessionStore } from "./session";
 import { sessionRuntime, setFocusedSessionRuntime } from "./session-runtime-context";
@@ -43,7 +52,6 @@ import {
 	pushTabExtensionUiRequest,
 	restoreTabComposer,
 	type SessionTab,
-	settleTabPlanApproval,
 	tabChipLabel,
 	tabDisplayTitle,
 	useSessionTabs,
@@ -99,9 +107,15 @@ interface MockOmp {
 		spawn: Mock<(payload: IpcSpawnTabPayload) => Promise<IpcSpawnTabResult | null>>;
 		close: Mock<(tabId: string) => Promise<boolean>>;
 		setActive: Mock<(tabId: string) => Promise<boolean>>;
+		setView: Mock<
+			(focusedTabId: string, visibleTabIds: string[], split?: IpcSetTabViewPayload["split"]) => Promise<boolean>
+		>;
 	};
 	events: {
 		onTabStatus: Mock<(callback: (payload: IpcTabStatusPayload) => void) => () => void>;
+	};
+	sessions: {
+		openInNewWindow: Mock<(payload: IpcSessionOpenNewWindowPayload) => Promise<IpcSessionOpenNewWindowResult>>;
 	};
 	rpc: {
 		getState: Mock<() => Promise<RpcResponse>>;
@@ -126,12 +140,16 @@ function installMockOmp(): { omp: MockOmp; emitTabStatus: TabStatusHandler } {
 			spawn: vi.fn(async () => null),
 			close: vi.fn(async () => true),
 			setActive: vi.fn(async () => true),
+			setView: vi.fn(async () => true),
 		},
 		events: {
 			onTabStatus: vi.fn((callback: TabStatusHandler) => {
 				tabStatusHandler = callback;
 				return () => {};
 			}),
+		},
+		sessions: {
+			openInNewWindow: vi.fn(async () => true),
 		},
 		rpc: {
 			getState: vi.fn(async () => ok(serverState())),
@@ -158,7 +176,6 @@ function seedTabs(active: "t0" | "t1" | "t2" = "t0"): void {
 			{ kind: "agent", id: "t2", cwd: "/gamma", status: "ready", unreadDone: false },
 		],
 		activeTabId: active,
-		bundles: new Map(),
 	});
 	for (const tabId of ["t0", "t1", "t2"]) ensureTabRuntime(tabId);
 	setFocusedSessionRuntime(active);
@@ -196,12 +213,6 @@ function fillLiveStores(tag: string): void {
 		.setImages([
 			{ content: { type: "image", data: `image-${tag}`, mimeType: "image/png" }, preview: `preview-${tag}` },
 		]);
-	usePlanApprovalStore.getState().showProposal({
-		planFilePath: `/plan-${tag}.md`,
-		planContent: `plan-${tag}`,
-		options: ["execute"],
-	});
-	usePlanApprovalStore.getState().setFeedback(`feedback-${tag}`);
 	useExtensionUiStore.getState().pushRequest({
 		type: "extension_ui_request",
 		id: `ui-${tag}`,
@@ -226,13 +237,14 @@ function resetAll(): void {
 	useSubagentsStore.getState().reset();
 	useModelStore.getState().reset();
 	useToolsStore.getState().reset();
-	usePlanApprovalStore.getState().clearProposal();
 	useExtensionUiStore.getState().clearAll();
 	useUiStore.getState().closeSessionOverlays();
 	useUiStore.getState().closeProviders();
+	useToastStore.setState({ toasts: [] });
 }
 
 afterEach(() => {
+	vi.useRealTimers();
 	resetAll();
 	vi.restoreAllMocks();
 	({ omp, emitTabStatus } = installMockOmp());
@@ -285,6 +297,21 @@ describe("tabs store boot reconciliation", () => {
 		expect(omp.tabs.setActive).toHaveBeenCalledWith("t1");
 	});
 
+	it("restores main's persisted split with its ratio clamped into the pane bounds", async () => {
+		omp.tabs.list.mockResolvedValue([
+			{ ...tabInfo("t0", "/alpha"), active: true, visible: true, split: { axis: "rows", index: 0, ratio: 0.95 } },
+			{ ...tabInfo("t1", "/beta"), visible: true, split: { axis: "rows", index: 1, ratio: 0.95 } },
+			tabInfo("t2", "/gamma"),
+		]);
+
+		await useTabsStore.getState().reconcileTabs();
+
+		const split = { axis: "rows", firstTabId: "t0", secondTabId: "t1", ratio: 0.8 };
+		expect(useTabsStore.getState().split).toEqual(split);
+		expect(omp.tabs.setView).toHaveBeenCalledWith("t0", ["t0", "t1"], split);
+		expect(omp.tabs.setActive).not.toHaveBeenCalled();
+	});
+
 	it("retains the restored transcript path before session metadata arrives", async () => {
 		omp.tabs.list.mockResolvedValue([
 			{ ...tabInfo("t0", "/alpha"), sessionPath: "/sessions/restored.jsonl", active: true },
@@ -298,7 +325,7 @@ describe("tabs store boot reconciliation", () => {
 		});
 	});
 
-	it("invalidates a parked bundle when boot reconciliation observes a replacement session", async () => {
+	it("replaces a parked runtime when boot reconciliation observes a replacement session", async () => {
 		seedTabs();
 		fillLiveStores("old");
 		useTabsStore.getState().applyTabStatus({
@@ -368,7 +395,7 @@ describe("tabs store switch", () => {
 		omp.tabs.list.mockResolvedValue([tabInfo("t0", "/alpha")]);
 		await useTabsStore.getState().reconcileTabs();
 		useSessionStore.setState({ cwd: "/alpha" });
-		omp.tabs.spawn.mockResolvedValue({ tabId: "t-work", cwd: "/Users/test/.omp/work" });
+		omp.tabs.spawn.mockResolvedValue({ tabId: "t-work", cwd: "/home/test/.omp/work" });
 
 		const tabId = await useTabsStore.getState().openTab({ work: true });
 
@@ -380,7 +407,7 @@ describe("tabs store switch", () => {
 			defaultWorkspace: true,
 			worktree: undefined,
 		});
-		expect(useTabsStore.getState().tabs.find(tab => tab.id === "t-work")?.cwd).toBe("/Users/test/.omp/work");
+		expect(useTabsStore.getState().tabs.find(tab => tab.id === "t-work")?.cwd).toBe("/home/test/.omp/work");
 	});
 
 	it("hydrates a fresh tab when its ready push beats full route wiring", async () => {
@@ -392,9 +419,7 @@ describe("tabs store switch", () => {
 		omp.tabs.setActive.mockReturnValueOnce(route.promise);
 
 		const opening = useTabsStore.getState().openTab({ kind: "chat" });
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(omp.tabs.setActive).toHaveBeenCalledWith("t1");
+		await vi.waitFor(() => expect(omp.tabs.setActive).toHaveBeenCalledWith("t1"));
 
 		// The light per-tab channel reports ready before main finishes attaching
 		// the full active-tab channel, so no full ready event will replay.
@@ -427,7 +452,39 @@ describe("tabs store switch", () => {
 
 		expect(tabId).toBeNull();
 		expect(useTabsStore.getState().tabs).toHaveLength(3);
-		expect(useToastStore.getState().toasts.some(toast => toast.variant === "error")).toBe(true);
+		expect(useToastStore.getState().toasts).toEqual([
+			expect.objectContaining({
+				variant: "error",
+				title: "Could not open tab",
+				message: "This conversation is from an older version of Sai ATLAS. Start a new task.",
+			}),
+		]);
+		expect(omp.tabs.setActive).not.toHaveBeenCalled();
+	});
+
+	it("switches to the owning tab when the session is already open in this window", async () => {
+		seedTabs();
+		omp.tabs.spawn.mockResolvedValue({ tabId: null, ownerTabId: "t1", refusal: "owned" });
+
+		const tabId = await useTabsStore.getState().openTab({ sessionPath: "/sessions/owned.jsonl" });
+
+		expect(tabId).toBe("t1");
+		expect(useTabsStore.getState().activeTabId).toBe("t1");
+		expect(useTabsStore.getState().tabs).toHaveLength(3);
+		expect(omp.tabs.setActive).toHaveBeenCalledWith("t1");
+		expect(omp.sessions.openInNewWindow).not.toHaveBeenCalled();
+	});
+
+	it("focuses the owner window when another window's tab holds the session", async () => {
+		seedTabs();
+		omp.tabs.spawn.mockResolvedValue({ tabId: null, ownerTabId: "t-other", ownerWinId: 2, refusal: "owned" });
+
+		const tabId = await useTabsStore.getState().openTab({ sessionPath: "/sessions/owned.jsonl" });
+
+		expect(tabId).toBe("t-other");
+		expect(omp.sessions.openInNewWindow).toHaveBeenCalledWith({ sessionPath: "/sessions/owned.jsonl" });
+		expect(useTabsStore.getState().activeTabId).toBe("t0");
+		expect(useTabsStore.getState().tabs).toHaveLength(3);
 		expect(omp.tabs.setActive).not.toHaveBeenCalled();
 	});
 
@@ -468,16 +525,15 @@ describe("tabs store switch", () => {
 
 		const firstSwitch = useTabsStore.getState().switchTab("t1");
 		const secondSwitch = useTabsStore.getState().switchTab("t2");
-		await Promise.resolve();
+		await vi.waitFor(() => expect(omp.tabs.setActive).toHaveBeenCalledTimes(1));
 
 		// UI selection remains immediate even while main-process routing catches up.
 		expect(useTabsStore.getState().activeTabId).toBe("t2");
 		expect(acceptsActiveTabEvents()).toBe(false);
-		expect(omp.tabs.setActive).toHaveBeenCalledTimes(1);
 
 		firstRoute.resolve(true);
 		await firstSwitch;
-		expect(omp.tabs.setActive).toHaveBeenCalledTimes(2);
+		await vi.waitFor(() => expect(omp.tabs.setActive).toHaveBeenCalledTimes(2));
 		// The superseded t1 route must not hydrate into t2's visible stores.
 		expect(acceptsActiveTabEvents()).toBe(false);
 		expect(omp.rpc.getState).not.toHaveBeenCalled();
@@ -491,7 +547,7 @@ describe("tabs store switch", () => {
 		expect(acceptsActiveTabEvents()).toBe(true);
 	});
 
-	it("snapshots the current tab's slices and restores the target's — draft included", async () => {
+	it("keeps each tab's slices in its own runtime and shows the target's on switch — draft included", async () => {
 		seedTabs();
 		fillLiveStores("t0");
 
@@ -500,7 +556,7 @@ describe("tabs store switch", () => {
 		omp.rpc.getTranscript.mockReturnValueOnce(gate.promise);
 		const firstSwitch = useTabsStore.getState().switchTab("t1");
 
-		// t1 has no bundle: stores reset to empty instantly, before any RPC settles.
+		// t1's runtime is fresh: its stores read empty instantly, before any RPC settles.
 		expect(useComposerStore.getState().draft).toBe("");
 		expect(useComposerStore.getState().images).toEqual([]);
 		expect(useMessagesStore.getState().messages).toEqual([]);
@@ -515,7 +571,7 @@ describe("tabs store switch", () => {
 		expect(useSessionStore.getState().sessionId).toBe("srv");
 		expect(useMessagesStore.getState().messages.map(m => messageText(m))).toEqual(["server-t1"]);
 
-		// t0's bundle is parked; t1 now gets its own recognizable live state.
+		// t0's runtime is parked; t1 now gets its own recognizable live state.
 		fillLiveStores("t1");
 		pushTabExtensionUiRequest("t0", {
 			type: "extension_ui_request",
@@ -529,7 +585,7 @@ describe("tabs store switch", () => {
 		omp.rpc.getTranscript.mockReturnValueOnce(gate2.promise);
 		const secondSwitch = useTabsStore.getState().switchTab("t0");
 
-		// Instant restore of t0's parked bundle — every slice, before hydrate.
+		// t0's parked runtime paints instantly — every slice, before hydrate.
 		expect(useComposerStore.getState().draft).toBe("draft-t0");
 		expect(useComposerStore.getState().images[0]?.content.data).toBe("image-t0");
 		expect(useMessagesStore.getState().messages.map(m => messageText(m))).toEqual(["hello-t0"]);
@@ -542,8 +598,6 @@ describe("tabs store switch", () => {
 		expect(useSubagentsStore.getState().subagents.has("a-t0")).toBe(true);
 		expect(useModelStore.getState().model?.id).toBe("m-t0");
 		expect(useModelStore.getState().fastModeEnabled).toBe(true);
-		expect(usePlanApprovalStore.getState().pending?.planContent).toBe("plan-t0");
-		expect(usePlanApprovalStore.getState().feedback).toBe("feedback-t0");
 		expect(useExtensionUiStore.getState().pendingRequests.map(request => request.id)).toEqual([
 			"ui-t0",
 			"ui-t0-late",
@@ -557,31 +611,11 @@ describe("tabs store switch", () => {
 		// Hydrate never touches the composer draft: t0's draft survives the switch.
 		expect(useComposerStore.getState().draft).toBe("draft-t0");
 
-		// …and t1's bundle parked its own draft, restored on the way back.
+		// …and t1's runtime kept its own draft, shown on the way back.
 		await useTabsStore.getState().switchTab("t1");
 		expect(useComposerStore.getState().draft).toBe("draft-t1");
 		expect(useComposerStore.getState().images[0]?.content.data).toBe("image-t1");
-		expect(usePlanApprovalStore.getState().pending?.planContent).toBe("plan-t1");
 		expect(useExtensionUiStore.getState().pendingRequests.map(request => request.id)).toEqual(["ui-t1"]);
-	});
-
-	it("settles an approval in its background tab without mutating the visible session", async () => {
-		seedTabs();
-		fillLiveStores("t0");
-		const proposal = usePlanApprovalStore.getState().pending;
-		expect(proposal).not.toBeNull();
-
-		await useTabsStore.getState().switchTab("t1");
-		fillLiveStores("t1");
-		settleTabPlanApproval("t0", "s-t0", proposal!, { clear: true, exitPlanMode: true });
-
-		expect(useSessionStore.getState().sessionId).toBe("s-t1");
-		expect(useSessionStore.getState().planModeEnabled).toBe(true);
-		expect(usePlanApprovalStore.getState().pending?.planContent).toBe("plan-t1");
-
-		await useTabsStore.getState().switchTab("t0");
-		expect(useSessionStore.getState().planModeEnabled).toBe(false);
-		expect(usePlanApprovalStore.getState().pending).toBeNull();
 	});
 
 	it("restores a failed submit to its background tab without touching the visible composer", async () => {
@@ -655,7 +689,6 @@ describe("tabs store switch", () => {
 
 	it("surfaces a SET_ACTIVE_TAB failure, re-converges from GET_TABS, and hydrates after the retry", async () => {
 		seedTabs();
-		useToastStore.setState({ toasts: [] });
 		omp.tabs.setActive.mockRejectedValueOnce(new Error("routing wedged"));
 		omp.tabs.list.mockResolvedValue([tabInfo("t0", "/alpha"), tabInfo("t1", "/beta"), tabInfo("t2", "/gamma")]);
 
@@ -667,14 +700,13 @@ describe("tabs store switch", () => {
 		// renderer's pick, so a transient failure re-points routing here…
 		expect(omp.tabs.list).toHaveBeenCalled();
 		expect(omp.tabs.setActive).toHaveBeenCalledTimes(2);
-		// …then hydrate paints the target instead of leaving the restored empty
-		// bundle on screen after the successful retry.
+		// …then hydrate paints the target instead of leaving its empty runtime
+		// on screen after the successful retry.
 		expect(omp.rpc.getTranscript).toHaveBeenCalledTimes(1);
 	});
 
 	it("treats a false SET_ACTIVE_TAB reply as a routing failure and recovers on retry", async () => {
 		seedTabs();
-		useToastStore.setState({ toasts: [] });
 		omp.tabs.setActive.mockResolvedValueOnce(false);
 		omp.tabs.list.mockResolvedValue([tabInfo("t0", "/alpha"), tabInfo("t1", "/beta"), tabInfo("t2", "/gamma")]);
 
@@ -720,8 +752,6 @@ describe("tabs store close", () => {
 		const setActiveOrder = omp.tabs.setActive.mock.invocationCallOrder[0];
 		const closeOrder = omp.tabs.close.mock.invocationCallOrder[0];
 		expect(setActiveOrder!).toBeLessThan(closeOrder!);
-		// The closed tab's parked bundle is gone.
-		expect(state.bundles.has("t1")).toBe(false);
 	});
 
 	it("closing the last tab in the strip activates its left neighbor", async () => {
@@ -814,7 +844,7 @@ describe("tabs store applyTabStatus", () => {
 		expect(useTabsStore.getState().tabs[0]?.sessionPath).toBeUndefined();
 	});
 
-	it("drops a parked bundle when the sidecar replaces its session", async () => {
+	it("drops a parked runtime when the sidecar replaces its session", async () => {
 		seedTabs();
 		fillLiveStores("old");
 		useTabsStore.getState().applyTabStatus({
@@ -847,7 +877,6 @@ describe("tabs store applyTabStatus", () => {
 		await useTabsStore.getState().switchTab("t0");
 		expect(useComposerStore.getState().draft).toBe("");
 		expect(useMessagesStore.getState().messages).toEqual([]);
-		expect(usePlanApprovalStore.getState().pending).toBeNull();
 	});
 });
 
@@ -927,7 +956,6 @@ describe("useSessionTabs hook", () => {
 		useTabsStore.setState({
 			tabs: [{ kind: "chat", id: "t1", cwd: "/beta", status: "starting", unreadDone: false }],
 			activeTabId: "t1",
-			bundles: new Map(),
 		});
 		await mount();
 		ensureTabRuntime("t1");
@@ -962,7 +990,6 @@ describe("useSessionTabs hook", () => {
 				},
 			],
 			activeTabId: "t1",
-			bundles: new Map(),
 		});
 		await mount();
 
@@ -1000,7 +1027,6 @@ describe("useSessionTabs hook", () => {
 				},
 			],
 			activeTabId: "t1",
-			bundles: new Map(),
 		});
 		// Spawned WITH --session /s.json: get_state already reports that file,
 		// so a second switch would only abort the in-flight resume.
@@ -1038,7 +1064,6 @@ describe("useSessionTabs hook", () => {
 				},
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		await mount();
 
@@ -1093,7 +1118,7 @@ describe("tabChipLabel (F-HYDRATE)", () => {
 	});
 
 	it("keeps an untitled global chat unnamed instead of exposing its internal cwd as a workspace", () => {
-		const chat = { ...chip("chat-0", "/Users/tester"), kind: "chat" as const };
+		const chat = { ...chip("chat-0", "/home/tester"), kind: "chat" as const };
 		expect(tabChipLabel(chat, [chat])).toBe("New session");
 	});
 
@@ -1182,6 +1207,10 @@ describe("tab runtime lifecycle guards", () => {
 		await useTabsStore.getState().switchTab("t1");
 
 		expect(useTabsStore.getState().activeTabId).toBe("t1");
+		const split = { axis: "columns", firstTabId: "t0", secondTabId: "t1", ratio: 0.5 };
+		expect(useTabsStore.getState().split).toEqual(split);
+		expect(omp.tabs.setView).toHaveBeenCalledWith("t1", ["t0", "t1"], split);
+		expect(useToastStore.getState().toasts).toEqual([]);
 		expect(useUiStore.getState().filePreview).toEqual({ kind: "path", path: "a.pdf", tabId: "t0" });
 	});
 
@@ -1193,6 +1222,11 @@ describe("tab runtime lifecycle guards", () => {
 		await useTabsStore.getState().switchTab("t2");
 
 		expect(useTabsStore.getState().activeTabId).toBe("t2");
+		// The outside tab replaces the focused pane; the split itself stays.
+		const split = { axis: "columns", firstTabId: "t2", secondTabId: "t1", ratio: 0.5 };
+		expect(useTabsStore.getState().split).toEqual(split);
+		expect(omp.tabs.setView).toHaveBeenCalledWith("t2", ["t2", "t1"], split);
+		expect(useToastStore.getState().toasts).toEqual([]);
 		expect(useUiStore.getState().filePreview).toBeNull();
 	});
 
@@ -1219,6 +1253,30 @@ describe("tab runtime lifecycle guards", () => {
 		await useTabsStore.getState().closeTab("t1");
 
 		expect(useUiStore.getState().filePreview).toMatchObject({ kind: "image", name: "paste.png" });
+	});
+
+	it("clamps split ratio steps at once and routes only the settled ratio after a quiet window", async () => {
+		seedTabs("t0");
+		useTabsStore.setState({ split: { axis: "columns", firstTabId: "t0", secondTabId: "t1", ratio: 0.5 } });
+		vi.useFakeTimers();
+
+		useTabsStore.getState().setSplitRatio(0.1);
+		expect(useTabsStore.getState().split?.ratio).toBe(0.2);
+		useTabsStore.getState().setSplitRatio(0.6);
+		useTabsStore.getState().setSplitRatio(0.95);
+		expect(useTabsStore.getState().split?.ratio).toBe(0.8);
+
+		await vi.advanceTimersByTimeAsync(249);
+		expect(omp.tabs.setView).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+
+		expect(omp.tabs.setView).toHaveBeenCalledTimes(1);
+		expect(omp.tabs.setView).toHaveBeenCalledWith("t0", ["t0", "t1"], {
+			axis: "columns",
+			firstTabId: "t0",
+			secondTabId: "t1",
+			ratio: 0.8,
+		});
 	});
 
 	it("refuses to re-split a tab that already occupies a pane", async () => {

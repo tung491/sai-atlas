@@ -34,6 +34,20 @@ describe("restored preferences", () => {
 	});
 });
 
+describe("setPanelTab", () => {
+	afterEach(() => {
+		useUiStore.setState({ panelTab: "files", panelVisible: false });
+	});
+
+	it("selects the drawer tab and opens the drawer", () => {
+		useUiStore.getState().setPanelTab("logs");
+		expect(useUiStore.getState()).toMatchObject({ panelTab: "logs", panelVisible: true });
+
+		useUiStore.getState().setPanelTab("files");
+		expect(useUiStore.getState().panelTab).toBe("files");
+	});
+});
+
 describe("file preview target", () => {
 	afterEach(() => {
 		useUiStore.setState({ filePreview: null, panelVisible: false, panelTab: "files" });

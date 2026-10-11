@@ -3,24 +3,6 @@ import type { AgentMessage, AgentSessionEvent, MessagesPage } from "../../shared
 import { messageIdentity, sameMessageContent } from "../lib/message-identity";
 import { createScopedStoreHook } from "./session-runtime-context";
 
-/**
- * Session-tab snapshot of committed history plus the active run overlay. The
- * accumulated strings are sufficient
- * to resume after a tab switch; keeping a second chunk-array copy only made
- * every snapshot and every join progressively more expensive.
- */
-export interface MessagesSnapshot {
-	messages: AgentMessage[];
-	liveMessages: AgentMessage[];
-	lastAppended: AgentMessage[];
-	streamingMessage: AgentMessage | null;
-	streamingText: string;
-	streamingThinking: string;
-	totalMessages: number;
-	nextCursor: string | undefined;
-	isLoadingPage: boolean;
-}
-
 export interface MessagesStore {
 	messages: AgentMessage[];
 	/** Uncommitted local echo and message_end deliveries for the active run. */
@@ -53,10 +35,6 @@ export interface MessagesStore {
 	 * mergeFetchedTranscript before this replacement.
 	 */
 	reconcileFetched: (fetched: AgentMessage[]) => void;
-	/** Capture the full stream state (fields + buffers) for a session-tab switch. */
-	snapshot: () => MessagesSnapshot;
-	/** Restore a captured snapshot; null resets to the empty initial state. */
-	restoreSnapshot: (snapshot: MessagesSnapshot | null) => void;
 	reset: () => void;
 }
 
@@ -280,37 +258,6 @@ export const createMessagesStore = () =>
 				messages: fetched,
 				liveMessages: liveMessages.length === state.liveMessages.length ? state.liveMessages : liveMessages,
 				totalMessages: fetched.length,
-			});
-		},
-		snapshot: () => {
-			const state = get();
-			return {
-				messages: state.messages,
-				liveMessages: state.liveMessages,
-				lastAppended: state.lastAppended,
-				streamingMessage: state.streamingMessage,
-				streamingText: state.streamingText,
-				streamingThinking: state.streamingThinking,
-				totalMessages: state.totalMessages,
-				nextCursor: state.nextCursor,
-				isLoadingPage: state.isLoadingPage,
-			};
-		},
-		restoreSnapshot: snapshot => {
-			if (!snapshot) {
-				get().reset();
-				return;
-			}
-			set({
-				messages: snapshot.messages,
-				liveMessages: snapshot.liveMessages,
-				lastAppended: snapshot.lastAppended,
-				streamingMessage: snapshot.streamingMessage,
-				streamingText: snapshot.streamingText,
-				streamingThinking: snapshot.streamingThinking,
-				totalMessages: snapshot.totalMessages,
-				nextCursor: snapshot.nextCursor,
-				isLoadingPage: snapshot.isLoadingPage,
 			});
 		},
 		reset: () => set(initialState),

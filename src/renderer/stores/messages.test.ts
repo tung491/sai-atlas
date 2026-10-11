@@ -27,7 +27,7 @@ function userMessage(entryId: string): AgentMessage {
 
 beforeEach(() => useMessagesStore.getState().reset());
 
-describe("messages streaming snapshots", () => {
+describe("messages streaming", () => {
 	it("preserves the next reply and follow-up regardless of event batch boundaries", () => {
 		const previous: AgentMessage = { role: "assistant", content: "previous", timestamp: 0, entryId: "previous" };
 		const followUp: AgentMessage = { role: "user", content: "next request", timestamp: 2 };
@@ -55,15 +55,18 @@ describe("messages streaming snapshots", () => {
 			});
 		}
 	});
-	it("resumes the accumulated prefix after switching away and back", () => {
-		useMessagesStore.getState().applyEvents([{ type: "message_start", message: streamingMessage }, delta("hel")]);
-		const snapshot = useMessagesStore.getState().snapshot();
+	it("accumulates thinking deltas across batches", () => {
+		const thinking = (text: string): AgentSessionEvent => ({
+			type: "message_update",
+			message: streamingMessage,
+			assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: text, partial: streamingMessage },
+		});
+		useMessagesStore
+			.getState()
+			.applyEvents([{ type: "message_start", message: streamingMessage }, thinking("Let me ")]);
+		useMessagesStore.getState().applyEvents([thinking("check")]);
 
-		useMessagesStore.getState().applyEvents([delta("discarded")]);
-		useMessagesStore.getState().restoreSnapshot(snapshot);
-		useMessagesStore.getState().applyEvents([delta("lo")]);
-
-		expect(useMessagesStore.getState().streamingText).toBe("hello");
+		expect(useMessagesStore.getState().streamingThinking).toBe("Let me check");
 	});
 
 	it("starts a new stream from an empty buffer even when the start and delta share a batch", () => {
@@ -187,6 +190,19 @@ describe("committed transcript ownership", () => {
 		expect(useMessagesStore.getState().totalMessages).toBe(1);
 	});
 
+	it("reports the rows a run committed as lastAppended, and hydration leaves it alone", () => {
+		const earlier = userMessage("earlier");
+		useMessagesStore.setState({ messages: [earlier], totalMessages: 1 });
+		const user = userMessage("user-entry");
+		const reply: AgentMessage = { role: "assistant", content: "answer", timestamp: 5, entryId: "reply-entry" };
+
+		useMessagesStore.getState().applyEvents([{ type: "agent_end", messages: [user, reply] }]);
+		expect(useMessagesStore.getState().lastAppended).toEqual([user, reply]);
+
+		useMessagesStore.getState().reconcileFetched([earlier, user, reply, userMessage("later")]);
+		expect(useMessagesStore.getState().lastAppended).toEqual([user, reply]);
+	});
+
 	it("does not erase a live response without a persisted replacement", () => {
 		const transient: AgentMessage = { role: "custom", customType: "notice", content: "temporary", timestamp: 1 };
 		useMessagesStore.getState().applyEvents([{ type: "message_end", message: transient }]);
@@ -215,6 +231,14 @@ describe("transcript hydration", () => {
 		const fetchedA = { ...a, content: "fetched" };
 
 		expect(mergeFetchedTranscript([fetchedA], [a], [refreshedA, b])).toEqual([fetchedA, b]);
+	});
+
+	it("drops the in-flight tail when the rows the fetch started from were replaced", () => {
+		const fetched = userMessage("x");
+
+		expect(mergeFetchedTranscript([fetched], [userMessage("a")], [userMessage("b"), userMessage("c")])).toEqual([
+			fetched,
+		]);
 	});
 
 	it("clears delivered live rows after idle hydration but preserves local echo", () => {

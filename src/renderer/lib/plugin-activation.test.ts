@@ -21,7 +21,6 @@ function activateTab(tabId = "t1", sessionId = "s1"): void {
 			{ id: "t2", cwd: "/w2", status: "ready", kind: "agent", unreadDone: false },
 		],
 		activeTabId: tabId,
-		bundles: new Map(),
 	});
 	useSessionStore.setState({ sessionId, sessionFile: `/${sessionId}.json`, isStreaming: false, isCompacting: false });
 }

@@ -89,7 +89,6 @@ function activateTab(): void {
 	useTabsStore.setState({
 		tabs: [{ id: "t1", cwd: "/w", status: "ready", kind: "agent", unreadDone: false }],
 		activeTabId: "t1",
-		bundles: new Map(),
 	});
 	useSessionStore.setState({ sessionId: "s1" });
 	resetTabRoute();
@@ -239,42 +238,47 @@ describe("AgentsDockCard", () => {
 		expect(container.querySelector('[role="tree"]')).not.toBeNull();
 	});
 
-	it("polls get_subagents while streaming, stops when the turn ends", async () => {
-		// Real timers + a short injected cadence: vi.useFakeTimers/advanceTimers
-		// are vitest-only, and this file must also pass under `bun test`.
-		const sleep = (ms: number) => {
-			const { promise, resolve } = Promise.withResolvers<void>();
-			setTimeout(resolve, ms);
-			return promise;
-		};
-		useSubagentsStore.getState().setSnapshots([snap({ id: "a1", status: "running" })]);
-		activateTab();
-		useSessionStore.setState({ isStreaming: true });
-		container = document.createElement("div") as unknown as HTMLElement;
-		document.body.appendChild(container as never);
-		root = createRoot(container as unknown as Element);
-		await act(async () => {
-			root.render(
-				<I18nProvider>
-					<AgentsDockCard pollMs={25} />
-				</I18nProvider>,
-			);
-		});
-		expect(getSubagents).not.toHaveBeenCalled();
+	it("polls get_subagents once per cadence while streaming, stops when the turn ends", async () => {
+		// Fake timers make the cadence exact under any suite load. Only the
+		// synchronous vi.advanceTimersByTime is used: bun test implements it, but
+		// not the async variant, and this file must also pass under `bun test`.
+		vi.useFakeTimers();
+		try {
+			useSubagentsStore.getState().setSnapshots([snap({ id: "a1", status: "running" })]);
+			activateTab();
+			useSessionStore.setState({ isStreaming: true });
+			container = document.createElement("div") as unknown as HTMLElement;
+			document.body.appendChild(container as never);
+			root = createRoot(container as unknown as Element);
+			await act(async () => {
+				root.render(
+					<I18nProvider>
+						<AgentsDockCard pollMs={1_000} />
+					</I18nProvider>,
+				);
+			});
+			const advance = async (ms: number) => {
+				await act(async () => {
+					vi.advanceTimersByTime(ms);
+				});
+			};
 
-		await act(async () => {
-			await sleep(60);
-		});
-		expect(getSubagents.mock.calls.length).toBeGreaterThanOrEqual(1);
+			// Nothing fires before the first full interval.
+			await advance(999);
+			expect(getSubagents).not.toHaveBeenCalled();
+			await advance(1);
+			expect(getSubagents).toHaveBeenCalledTimes(1);
+			await advance(1_000);
+			expect(getSubagents).toHaveBeenCalledTimes(2);
 
-		// Turn ends → interval cleared, no further polls.
-		await act(async () => {
-			useSessionStore.setState({ isStreaming: false });
-		});
-		const callsAtStop = getSubagents.mock.calls.length;
-		await act(async () => {
-			await sleep(60);
-		});
-		expect(getSubagents.mock.calls.length).toBe(callsAtStop);
+			// Turn ends → interval cleared, no further polls however long it idles.
+			await act(async () => {
+				useSessionStore.setState({ isStreaming: false });
+			});
+			await advance(30_000);
+			expect(getSubagents).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

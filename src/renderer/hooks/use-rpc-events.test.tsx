@@ -1126,7 +1126,6 @@ describe("useRpcEvents non-transcript frames", () => {
 				{ kind: "agent", id: "t1", cwd: "/beta", status: "ready", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		const route = Promise.withResolvers<boolean>();
 		omp.tabs.setActive.mockReturnValueOnce(route.promise);
@@ -1195,7 +1194,6 @@ describe("retryPending reset on tab switch", () => {
 				{ kind: "agent", id: "t1", cwd: "/beta", status: "ready", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		useToastStore.setState({ toasts: [] });
 		await mount(<RpcEventsProbe />);

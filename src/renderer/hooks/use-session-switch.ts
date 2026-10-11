@@ -26,7 +26,6 @@ import { useComposerStore } from "../stores/composer";
 import { useExtensionUiStore } from "../stores/extension-ui";
 import { useMessagesStore } from "../stores/messages";
 import { useModelStore } from "../stores/model";
-import { usePlanApprovalStore } from "../stores/plan-approval";
 import { useQueueStore } from "../stores/queue";
 import { useSessionStore } from "../stores/session";
 import { useSubagentsStore } from "../stores/subagents";
@@ -48,7 +47,6 @@ export function resetSessionSurface(closeOverlays = true): void {
 	useModelStore.getState().reset();
 	useQueueStore.getState().setFromFrame({ steering: [], followUp: [] });
 	useExtensionUiStore.getState().clearAll();
-	usePlanApprovalStore.getState().clearProposal();
 	if (closeOverlays) {
 		useUiStore.getState().closeSessionOverlays();
 	}

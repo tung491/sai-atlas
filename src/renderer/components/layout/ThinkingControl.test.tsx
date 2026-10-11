@@ -206,7 +206,6 @@ describe("ThinkingControl", () => {
 				{ id: "t1", cwd: "/two", status: "ready", kind: "agent", unreadDone: false },
 			],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 		useSessionStore.setState({ sessionId: "session-one" });
 		useModelStore.setState({

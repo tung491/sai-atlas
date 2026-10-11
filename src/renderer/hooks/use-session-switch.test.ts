@@ -16,7 +16,6 @@ import type { RpcResponse, RpcSessionState } from "../../shared/rpc-types";
 import { useComposerStore } from "../stores/composer";
 import { useMessagesStore } from "../stores/messages";
 import { useModelStore } from "../stores/model";
-import { usePlanApprovalStore } from "../stores/plan-approval";
 import { useQueueStore } from "../stores/queue";
 import { useSessionStore } from "../stores/session";
 import { useSubagentsStore } from "../stores/subagents";
@@ -133,7 +132,6 @@ function seedTabs(): void {
 			{ kind: "agent", id: "t1", cwd: "/beta", status: "ready", unreadDone: false },
 		],
 		activeTabId: "t0",
-		bundles: new Map(),
 	});
 }
 
@@ -147,7 +145,6 @@ function resetAll(): void {
 	useSubagentsStore.getState().reset();
 	useModelStore.getState().reset();
 	useToolsStore.getState().reset();
-	usePlanApprovalStore.getState().clearProposal();
 	useUiStore.getState().closeSessionOverlays();
 	useToastStore.setState({ toasts: [] });
 }
@@ -294,11 +291,6 @@ describe("switchSessionNow F-OWN owner guard", () => {
 		});
 		useTodoStore.getState().setPhases([{ name: "old phase", tasks: [] }]);
 		useModelStore.setState({ model: { provider: "old", id: "old-model" } });
-		usePlanApprovalStore.getState().showProposal({
-			planFilePath: "/old-plan.md",
-			planContent: "old plan",
-			options: ["execute"],
-		});
 		useUiStore.getState().openSessionInfo();
 		useSessionStore.setState({
 			goal: { objective: "old goal" },
@@ -426,7 +418,6 @@ describe("switchSessionNow F-OWN owner guard", () => {
 		useTabsStore.setState({
 			tabs: [{ kind: "chat", id: "t0", cwd: "/alpha", status: "ready", unreadDone: false }],
 			activeTabId: "t0",
-			bundles: new Map(),
 		});
 
 		const result = await switchSessionNow(session("/sessions/agent.jsonl"));

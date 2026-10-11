@@ -5,7 +5,7 @@
  * agents from the UI mid-poll. Live rows absent from the fetch are released.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RpcResponse, SubagentSnapshot } from "../../shared/rpc-types";
+import type { AgentProgress, RpcResponse, SubagentSnapshot } from "../../shared/rpc-types";
 import { useSubagentsStore } from "./subagents";
 
 const getSubagents = vi.fn();
@@ -178,5 +178,56 @@ describe("subagents store refresh", () => {
 		getSubagents.mockRejectedValue(new Error("sidecar gone"));
 		await useSubagentsStore.getState().refresh();
 		expect(useSubagentsStore.getState().subagents.has("live")).toBe(true);
+	});
+});
+
+describe("subagents store progress frames", () => {
+	function progress(overrides: Partial<AgentProgress>): AgentProgress {
+		return {
+			index: 0,
+			id: "late",
+			agent: "scout",
+			agentSource: "bundled",
+			status: "running",
+			task: "map the repo",
+			recentTools: [],
+			recentOutput: [],
+			toolCount: 0,
+			requests: 1,
+			tokens: 0,
+			cost: 0,
+			durationMs: 0,
+			...overrides,
+		};
+	}
+
+	function progressFrame(update: AgentProgress) {
+		return {
+			type: "subagent_progress" as const,
+			payload: {
+				index: 0,
+				agent: "scout",
+				agentSource: "bundled" as const,
+				task: "map the repo",
+				parentToolCallId: "call-1",
+				progress: update,
+			},
+		};
+	}
+
+	it("shows the live progress of a subagent first seen through a progress frame", () => {
+		const first = progress({ currentTool: "grep", toolCount: 2, tokens: 900, durationMs: 4_000 });
+		useSubagentsStore.getState().applyFrame(progressFrame(first));
+
+		expect(useSubagentsStore.getState().subagents.get("late")).toMatchObject({
+			status: "running",
+			task: "map the repo",
+			parentToolCallId: "call-1",
+			progress: first,
+		});
+
+		const next = progress({ currentTool: "read", toolCount: 3, tokens: 1_400, durationMs: 6_000 });
+		useSubagentsStore.getState().applyFrame(progressFrame(next));
+		expect(useSubagentsStore.getState().subagents.get("late")?.progress).toBe(next);
 	});
 });

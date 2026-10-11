@@ -14,6 +14,7 @@ const set = vi.fn(async (_key: string, _value: unknown) => {});
 (globalThis as Record<string, unknown>).window = { omp: { prefs: { get, set } } };
 
 afterEach(() => {
+	vi.useRealTimers();
 	get.mockClear();
 	set.mockClear();
 	useSidebarPrefs.getState().reset();
@@ -43,20 +44,45 @@ describe("sidebar-prefs store", () => {
 	});
 
 	it("touches sessions with a monotonic persisted MRU clock", () => {
-		useSidebarPrefs.setState({ sessionLastUsed: { "/sessions/old.jsonl": 30 } });
+		// A stored time ahead of the wall clock (a clock stepped backwards) and two
+		// touches inside one millisecond must still order strictly by touch.
+		vi.useFakeTimers({ now: 1_000 });
+		useSidebarPrefs.setState({ sessionLastUsed: { "/sessions/old.jsonl": 5_000 } });
 
 		useSidebarPrefs.getState().touchSession("/sessions/new.jsonl");
-		const sessionTimestamp = useSidebarPrefs.getState().sessionLastUsed["/sessions/new.jsonl"];
-		expect(sessionTimestamp).toBeGreaterThan(30);
+		expect(useSidebarPrefs.getState().sessionLastUsed["/sessions/new.jsonl"]).toBe(5_001);
 		expect(set).toHaveBeenLastCalledWith(
 			"sidebar",
 			expect.objectContaining({
-				sessionLastUsed: expect.objectContaining({ "/sessions/new.jsonl": sessionTimestamp }),
+				sessionLastUsed: expect.objectContaining({ "/sessions/new.jsonl": 5_001 }),
 			}),
 		);
 
 		useSidebarPrefs.getState().touchSession("/sessions/old.jsonl");
-		expect(useSidebarPrefs.getState().sessionLastUsed["/sessions/old.jsonl"]).toBeGreaterThan(sessionTimestamp ?? 0);
+		expect(useSidebarPrefs.getState().sessionLastUsed["/sessions/old.jsonl"]).toBe(5_002);
+	});
+
+	it("uses the wall clock once it is ahead of every stored time", () => {
+		vi.useFakeTimers({ now: 9_000 });
+		useSidebarPrefs.setState({ sessionLastUsed: { "/sessions/old.jsonl": 5_000 } });
+
+		useSidebarPrefs.getState().touchSession("/sessions/new.jsonl");
+
+		expect(useSidebarPrefs.getState().sessionLastUsed["/sessions/new.jsonl"]).toBe(9_000);
+	});
+
+	it("keeps the 500 most recently used sessions", () => {
+		vi.useFakeTimers({ now: 1_000 });
+		const seeded = Object.fromEntries(Array.from({ length: 500 }, (_, index) => [`/s/${index}.jsonl`, index + 1]));
+		useSidebarPrefs.setState({ sessionLastUsed: seeded });
+
+		useSidebarPrefs.getState().touchSession("/s/new.jsonl");
+
+		const recent = useSidebarPrefs.getState().sessionLastUsed;
+		expect(Object.keys(recent)).toHaveLength(500);
+		expect(recent["/s/new.jsonl"]).toBe(1_000);
+		expect(recent["/s/0.jsonl"]).toBeUndefined();
+		expect(recent["/s/1.jsonl"]).toBe(2);
 	});
 
 	it("hydrates from the persisted blob once and tolerates missing prefs", async () => {

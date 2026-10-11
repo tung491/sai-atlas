@@ -117,7 +117,6 @@ async function mount(): Promise<void> {
 	useTabsStore.setState({
 		tabs: [{ kind: "agent", id: "t0", cwd: "/tmp", status: "ready", unreadDone: false }],
 		activeTabId: "t0",
-		bundles: new Map(),
 	});
 	const element = document.createElement("div");
 	document.body.appendChild(element);

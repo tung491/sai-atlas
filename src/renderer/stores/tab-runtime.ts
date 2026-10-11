@@ -3,7 +3,6 @@ import { type ComposerStore, createComposerStore } from "./composer";
 import { createExtensionUiStore } from "./extension-ui";
 import { createMessagesStore } from "./messages";
 import { createModelStore } from "./model";
-import { createPlanApprovalStore } from "./plan-approval";
 import { createQueueStore } from "./queue";
 import { createSessionStore, type SessionStore } from "./session";
 import {
@@ -80,7 +79,6 @@ export function createTabRuntime(tabId: string): SessionRuntime {
 	addRuntimeStore(runtime, "extensionUi", createExtensionUiStore());
 	addRuntimeStore(runtime, "messages", createMessagesStore());
 	addRuntimeStore(runtime, "model", createModelStore(command));
-	addRuntimeStore(runtime, "planApproval", createPlanApprovalStore());
 	addRuntimeStore(runtime, "queue", createQueueStore(command));
 	addRuntimeStore(runtime, "session", createSessionStore());
 	addRuntimeStore(runtime, "settings", createSettingsStore(command));
