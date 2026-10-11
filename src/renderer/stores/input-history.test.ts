@@ -49,9 +49,11 @@ describe("input-history secret scrubbing", () => {
 		"/login sk-ant-oat01-secret",
 		"/join omp://share/abc123def456?write=tok_secret",
 		"/mcp add myserver --url http://x --token sk-secret123",
+		"/mcp add myserver --url http://x --token=sk-secret123",
+		"/mcp add myserver --url http://x --token\tsk-secret123",
 	];
 	for (const secret of secretInputs) {
-		it(`keeps "${secret.split(" ")[0]}" with secrets out of persisted prefs`, () => {
+		it(`keeps ${JSON.stringify(secret)} out of persisted prefs`, () => {
 			const prefs = installPrefs();
 			useInputHistoryStore.getState().record(secret);
 			// Still recallable from the in-memory session list…
@@ -98,6 +100,25 @@ describe("input-history secret scrubbing", () => {
 		expect(prefs.set).not.toHaveBeenCalled();
 	});
 
+	it("caps recorded history at 200 entries, dropping the oldest", () => {
+		const prefs = installPrefs();
+		for (let index = 0; index <= 200; index++) useInputHistoryStore.getState().record(`prompt ${index}`);
+		const entries = useInputHistoryStore.getState().entries;
+		expect(entries).toHaveLength(200);
+		expect(entries[0]?.prompt).toBe("prompt 200");
+		expect(entries.at(-1)?.prompt).toBe("prompt 1");
+		expect(persistedPrompts(prefs)).toHaveLength(200);
+	});
+
+	it("caps hydrated history at 200 entries, keeping the newest", async () => {
+		installPrefs(Array.from({ length: 201 }, (_, index) => ({ prompt: `stored ${index}`, ts: index })));
+		await useInputHistoryStore.getState().hydrate();
+		const entries = useInputHistoryStore.getState().entries;
+		expect(entries).toHaveLength(200);
+		expect(entries[0]?.prompt).toBe("stored 0");
+		expect(entries.at(-1)?.prompt).toBe("stored 199");
+	});
+
 	it("recalls only the current workspace and does not cross tab owners", () => {
 		installPrefs();
 		useInputHistoryStore.getState().record("workspace one", "/work/one");
@@ -115,6 +136,8 @@ describe("shouldSkipHistory", () => {
 		expect(shouldSkipHistory("/login:?code=abc&state=xyz")).toBe(true);
 		expect(shouldSkipHistory("/join omp:abc123def456")).toBe(true);
 		expect(shouldSkipHistory("/mcp add myserver --token tok123")).toBe(true);
+		expect(shouldSkipHistory("/mcp add myserver --token=tok123")).toBe(true);
+		expect(shouldSkipHistory("/mcp add myserver --token\ttok123")).toBe(true);
 	});
 
 	it("ignores ordinary prompts and benign slash commands", () => {

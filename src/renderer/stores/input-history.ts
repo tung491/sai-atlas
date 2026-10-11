@@ -58,7 +58,7 @@ export function filterHistory(entries: InputHistoryEntry[], query: string, limit
  * - /login accepts three callback forms (redirect URL, query string, raw auth
  *   code) — all can contain OAuth code=/state= params.
  * - /join <link> carries a 32-byte room key and optional write token.
- * - /mcp add --token <token> carries a bearer token.
+ * - /mcp add --token <token> (or --token=<token>) carries a bearer token.
  *
  * The command name is extracted the same way as the agent's parseSlashCommand()
  * — splitting on the earliest whitespace or colon — so /login:?code=... is
@@ -80,7 +80,7 @@ export function shouldSkipHistory(text: string): boolean {
 	if (name === "join" && hasArgs) return true;
 	if (name === "mcp") {
 		const args = body.slice(sep + 1).trim();
-		return args.startsWith("add") && /--token\s/.test(args);
+		return args.startsWith("add") && /--token(\s|=)/.test(args);
 	}
 	return false;
 }
