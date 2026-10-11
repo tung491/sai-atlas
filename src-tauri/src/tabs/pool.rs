@@ -13,6 +13,11 @@
 //! - every tab, visible or not, pushes the light `tab:status` channel, so
 //!   background tabs report status flips and title/id changes.
 //!
+//! A background tab's sidecar still waits for an answer to its blocking
+//! extension UI, host tool and host URI requests. Those are held on the tab and
+//! forwarded once it is shown; a tab that closes first answers them as
+//! cancelled, and a restart drops them along with the process that asked.
+//!
 //! Session ownership (the double-attach guard): `session_owners` maps a session
 //! file to the tab attached to it. It is registered at acquire (spawn with a
 //! session path) and from the RPC passthrough (`note_session_file`), and dropped
@@ -45,9 +50,10 @@ use crate::ports::{
 
 use super::snowflake::next_snowflake;
 
-/// `TAB_LAYOUT_VERSION` from `tab-layout.ts`.
+/// The `version` of every persisted tab layout.
 const TAB_LAYOUT_VERSION: u32 = 1;
-/// Split ratios are clamped to this range (`sidecar-pool.ts:507`).
+/// Split ratios are clamped to this range, as the renderer's `clampRatio`
+/// does (`src/renderer/stores/tabs.ts`).
 const SPLIT_RATIO_MIN: f64 = 0.2;
 const SPLIT_RATIO_MAX: f64 = 0.8;
 
@@ -72,12 +78,44 @@ const CHANNEL_EXTENSION_ERROR: &str = "extension:error";
 const CHANNEL_LIVE_UPDATE: &str = "live:update";
 const CHANNEL_MODEL_CATALOG_UPDATE: &str = "model-catalog:update";
 
+/// The error a held host request is answered with when its tab closes unseen.
+const REQUEST_TAB_CLOSED: &str = "The tab closed before the request was shown";
+
 type LayoutListener = Arc<dyn Fn(WindowId, Option<PersistedTabLayout>) + Send + Sync>;
+
+fn is_blocking_ui(request: &Value) -> bool {
+    request.get("method").and_then(Value::as_str).is_some_and(|method| BLOCKING_UI_METHODS.contains(&method))
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // Pool state stays consistent between statements; a panic elsewhere must not
     // take every tab's routing down with it.
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A request whose sidecar waits for the answer, raised by a background tab.
+enum HeldRequest {
+    ExtensionUi(Value),
+    HostUri(Value),
+    HostTool(Value),
+}
+
+impl HeldRequest {
+    fn id(&self) -> Option<&str> {
+        match self {
+            Self::ExtensionUi(request) | Self::HostUri(request) | Self::HostTool(request) => request.get("id").and_then(Value::as_str),
+        }
+    }
+
+    /// The answer telling the sidecar the request will never be shown.
+    fn cancellation(&self) -> Option<Value> {
+        let id = self.id()?;
+        Some(match self {
+            Self::ExtensionUi(_) => json!({ "type": "extension_ui_response", "id": id, "cancelled": true }),
+            Self::HostUri(_) => json!({ "type": "host_uri_result", "id": id, "error": REQUEST_TAB_CLOSED }),
+            Self::HostTool(_) => json!({ "type": "host_tool_result", "id": id, "error": REQUEST_TAB_CLOSED }),
+        })
+    }
 }
 
 struct Entry {
@@ -112,6 +150,9 @@ struct Entry {
     /// Only the quit guard's inventory reads it: tab status and idle-session
     /// routing follow the agent run alone.
     user_execs: usize,
+    /// Requests raised while the tab was in the background, in arrival order;
+    /// they forward when the tab is shown.
+    held: Vec<HeldRequest>,
 }
 
 impl Entry {
@@ -171,15 +212,26 @@ impl Entry {
         self.ensure_started();
         self.full_wired = true;
     }
+
+    /// Answer every held request as cancelled: the tab goes away unseen.
+    fn cancel_held(&mut self) {
+        for request in self.held.drain(..) {
+            if let Some(answer) = request.cancellation() {
+                self.sidecar.send_side_channel(answer);
+            }
+        }
+    }
 }
 
 /// What a state change produced: renderer sends (made under the lock), layout
-/// notifications and sidecar disposals (both run after it is released).
+/// notifications, sidecar disposals and host tool calls (run after it is
+/// released; a host tool call needs the services port).
 #[derive(Default)]
 struct Outbox {
     sends: Vec<(WindowId, &'static str, Value)>,
     notify: Vec<WindowId>,
     disposals: Vec<BoxFuture<'static, ()>>,
+    host_tool_calls: Vec<(u64, Value)>,
 }
 
 impl Outbox {
@@ -268,14 +320,79 @@ impl PoolState {
         }
     }
 
-    fn sync_full_wiring(&mut self, win_id: WindowId) {
+    fn sync_full_wiring(&mut self, win_id: WindowId, out: &mut Outbox) {
         let visible = self.visible_by_window.get(&win_id).cloned().unwrap_or_default();
-        for entry in self.entries.iter_mut().filter(|entry| entry.win_id == win_id) {
-            if visible.contains(&entry.tab_id) {
-                entry.wire_full();
-            } else {
-                entry.full_wired = false;
+        for index in 0..self.entries.len() {
+            let entry = &mut self.entries[index];
+            if entry.win_id != win_id {
+                continue;
             }
+            if !visible.contains(&entry.tab_id) {
+                entry.full_wired = false;
+                continue;
+            }
+            entry.wire_full();
+            // What the tab raised in the background reaches its window now.
+            for request in std::mem::take(&mut entry.held) {
+                self.forward_request(index, request, out);
+            }
+        }
+    }
+
+    /// Forward a request entry `index` raised, or hold it while the tab is in
+    /// the background. A background tab's fire-and-forget UI update is dropped.
+    /// A `cancel` drops the response route of the request it targets, and
+    /// withdraws that request when it is still held; otherwise it reaches the
+    /// window, which may be showing the request already, shown tab or not.
+    fn raise_request(&mut self, index: usize, request: HeldRequest, out: &mut Outbox) {
+        if let HeldRequest::ExtensionUi(frame) = &request {
+            if frame.get("method").and_then(Value::as_str) == Some("cancel") {
+                let target = frame.get("targetId").and_then(Value::as_str);
+                let key = self.entries[index].key;
+                if let Some(target) = target.filter(|target| self.request_owners.get(*target) == Some(&key)) {
+                    self.request_owners.remove(target);
+                }
+                let entry = &mut self.entries[index];
+                let before = entry.held.len();
+                entry.held.retain(|held| target.is_none() || held.id() != target);
+                if entry.full_wired || entry.held.len() == before {
+                    self.forward_request(index, request, out);
+                }
+                return;
+            }
+        }
+        let entry = &mut self.entries[index];
+        if entry.full_wired {
+            self.forward_request(index, request, out);
+            return;
+        }
+        if let HeldRequest::ExtensionUi(frame) = &request {
+            if !is_blocking_ui(frame) {
+                return;
+            }
+        }
+        entry.held.push(request);
+    }
+
+    /// Send a request of a shown tab to its window, recording its id for the
+    /// response route. Host tool calls run after the lock is released.
+    fn forward_request(&mut self, index: usize, request: HeldRequest, out: &mut Outbox) {
+        let entry = &self.entries[index];
+        let (key, win_id) = (entry.key, entry.win_id);
+        match request {
+            HeldRequest::ExtensionUi(request) => {
+                if let (true, Some(id)) = (is_blocking_ui(&request), request.get("id").and_then(Value::as_str)) {
+                    self.request_owners.insert(id.to_string(), key);
+                }
+                out.send(win_id, CHANNEL_EXTENSION_UI, json!({ "tabId": entry.tab_id, "request": request }));
+            }
+            HeldRequest::HostUri(request) => {
+                if let Some(id) = request.get("id").and_then(Value::as_str) {
+                    self.request_owners.insert(id.to_string(), key);
+                }
+                out.send(win_id, CHANNEL_HOST_URI_REQUEST, json!({ "request": request }));
+            }
+            HeldRequest::HostTool(request) => out.host_tool_calls.push((key, request)),
         }
     }
 
@@ -285,12 +402,13 @@ impl PoolState {
     /// `window_closing` skips that hand-over: every tab of the window goes.
     fn release_entry(&mut self, index: usize, window_closing: bool, out: &mut Outbox) {
         self.unregister_session_file(index);
-        let entry = self.entries.remove(index);
+        let mut entry = self.entries.remove(index);
         if self.by_tab_id.get(&entry.tab_id) == Some(&entry.key) {
             self.by_tab_id.remove(&entry.tab_id);
         }
         // A late renderer response must fall back, never write to a dead sidecar.
         self.request_owners.retain(|_, key| *key != entry.key);
+        entry.cancel_held();
         out.disposals.push(entry.sidecar.dispose());
 
         let win_id = entry.win_id;
@@ -308,7 +426,7 @@ impl PoolState {
         }
         if self.active_by_window.get(&win_id) != Some(&entry.tab_id) {
             if !window_closing {
-                self.sync_full_wiring(win_id);
+                self.sync_full_wiring(win_id, out);
             }
             return;
         }
@@ -327,7 +445,7 @@ impl PoolState {
             self.visible_by_window.insert(win_id, vec![candidate_tab.clone()]);
         }
         self.active_by_window.insert(win_id, candidate_tab);
-        self.sync_full_wiring(win_id);
+        self.sync_full_wiring(win_id, out);
     }
 
     fn tabs_for_window(&self, win_id: WindowId) -> Vec<IpcTabInfo> {
@@ -392,10 +510,15 @@ impl PoolState {
             SidecarEvent::Status(payload) => {
                 let entry = &mut self.entries[index];
                 entry.status = payload.status;
-                // A restart or exit kills any in-flight run along with the process.
+                // A restart or exit kills any in-flight run along with the process,
+                // and nobody waits for the requests that process raised. A failed
+                // health check leaves the process running, still waiting on them.
                 if payload.status != SidecarStatus::Ready {
                     entry.running = false;
                     entry.compacting = None;
+                }
+                if matches!(payload.status, SidecarStatus::Restarting | SidecarStatus::Exited) {
+                    entry.held.clear();
                 }
                 out.send_tab_status(entry);
                 if entry.full_wired {
@@ -463,26 +586,9 @@ impl PoolState {
                     out.send_active(entry, CHANNEL_SESSION_INFO_UPDATE, frame);
                 }
             }
-            SidecarEvent::ExtensionUi(request) => {
-                if !self.entries[index].full_wired {
-                    return;
-                }
-                let blocking = request.get("method").and_then(Value::as_str).is_some_and(|method| BLOCKING_UI_METHODS.contains(&method));
-                if let (true, Some(id)) = (blocking, request.get("id").and_then(Value::as_str)) {
-                    self.request_owners.insert(id.to_string(), self.entries[index].key);
-                }
-                let entry = &self.entries[index];
-                out.send(entry.win_id, CHANNEL_EXTENSION_UI, json!({ "tabId": entry.tab_id, "request": request }));
-            }
-            SidecarEvent::HostUriRequest(request) => {
-                if !self.entries[index].full_wired {
-                    return;
-                }
-                if let Some(id) = request.get("id").and_then(Value::as_str) {
-                    self.request_owners.insert(id.to_string(), self.entries[index].key);
-                }
-                out.send(self.entries[index].win_id, CHANNEL_HOST_URI_REQUEST, json!({ "request": request }));
-            }
+            SidecarEvent::ExtensionUi(request) => self.raise_request(index, HeldRequest::ExtensionUi(request), out),
+            SidecarEvent::HostUriRequest(request) => self.raise_request(index, HeldRequest::HostUri(request), out),
+            SidecarEvent::HostToolCall(request) => self.raise_request(index, HeldRequest::HostTool(request), out),
             SidecarEvent::SubagentFrame(frame) => self.forward_active(index, CHANNEL_SUBAGENT_FRAME, frame, out),
             SidecarEvent::LiveUpdate(frame) => self.forward_active(index, CHANNEL_LIVE_UPDATE, frame, out),
             SidecarEvent::ModelCatalogUpdate(frame) => self.forward_active(index, CHANNEL_MODEL_CATALOG_UPDATE, frame, out),
@@ -491,9 +597,8 @@ impl PoolState {
             SidecarEvent::PromptResult(frame) => self.forward_active(index, CHANNEL_PROMPT_RESULT, frame, out),
             SidecarEvent::CommandOutput(frame) => self.forward_active(index, CHANNEL_COMMAND_OUTPUT, frame, out),
             SidecarEvent::ExtensionError(frame) => self.forward_active(index, CHANNEL_EXTENSION_ERROR, frame, out),
-            // Host tool calls need the services port outside the lock (`SidecarPool::host_tool_call`).
-            // Raw frames and stderr are not routed to the renderer (the TS pool never wired them).
-            SidecarEvent::HostToolCall(_) | SidecarEvent::Frame(_) | SidecarEvent::Stderr(_) => {}
+            // Raw frames and stderr are not routed to the renderer: nothing there reads them.
+            SidecarEvent::Frame(_) | SidecarEvent::Stderr(_) => {}
         }
     }
 
@@ -510,7 +615,7 @@ struct Inner {
     max: usize,
     state: Mutex<PoolState>,
     listeners: Mutex<Vec<LayoutListener>>,
-    /// The ready health check (`index.ts:380-393`), switched on by `tabs::init`.
+    /// The ready health check, switched on by `tabs::init`.
     health_check: AtomicBool,
 }
 
@@ -570,6 +675,9 @@ impl SidecarPool {
         };
         for disposal in out.disposals {
             spawn_task(disposal);
+        }
+        for (key, request) in out.host_tool_calls {
+            self.call_host_tool(key, request);
         }
         if !layouts.is_empty() {
             let listeners = lock(&self.inner.listeners).clone();
@@ -654,6 +762,7 @@ impl SidecarPool {
                 full_wired: false,
                 started: false,
                 user_execs: 0,
+                held: Vec::new(),
             });
             state.by_tab_id.insert(tab_id.clone(), key);
             let index = state.entries.len() - 1;
@@ -666,7 +775,7 @@ impl SidecarPool {
             if !options.defer_start && !state.active_by_window.contains_key(&options.win_id) {
                 state.active_by_window.insert(options.win_id, tab_id.clone());
                 state.visible_by_window.insert(options.win_id, vec![tab_id.clone()]);
-                state.sync_full_wiring(options.win_id);
+                state.sync_full_wiring(options.win_id, out);
             }
             if !options.defer_start {
                 if let Some(index) = state.index_of_key(key) {
@@ -695,9 +804,6 @@ impl SidecarPool {
 
     /// False when the entry is gone (released), which ends its drain task.
     fn handle_event(&self, key: u64, event: SidecarEvent) -> bool {
-        if let SidecarEvent::HostToolCall(request) = event {
-            return self.host_tool_call(key, request);
-        }
         let ready = matches!(&event, SidecarEvent::Status(payload) if payload.status == SidecarStatus::Ready);
         let sidecar = self.with_state(|state, out| {
             let index = state.index_of_key(key)?;
@@ -712,16 +818,13 @@ impl SidecarPool {
         true
     }
 
-    /// A GUI host tool is answered here; any other tool goes to the owning
-    /// window's renderer, with its request id recorded for the response route.
-    fn host_tool_call(&self, key: u64, request: Value) -> bool {
-        let target = self.read(|state| {
-            let entry = &state.entries[state.index_of_key(key)?];
-            Some(entry.full_wired.then(|| (entry.win_id, entry.sidecar.clone())))
-        });
-        let Some(target) = target else { return false };
-        let Some((win_id, sidecar)) = target else { return true };
-        let Some(ctx) = self.ctx() else { return true };
+    /// Run a shown tab's host tool call. A GUI host tool is answered here; any
+    /// other tool goes to the owning window's renderer, with its request id
+    /// recorded for the response route.
+    fn call_host_tool(&self, key: u64, request: Value) {
+        let target = self.read(|state| state.index_of_key(key).map(|index| (state.entries[index].win_id, state.entries[index].sidecar.clone())));
+        let Some((win_id, sidecar)) = target else { return };
+        let Some(ctx) = self.ctx() else { return };
         let name = request.get("toolName").and_then(Value::as_str).unwrap_or_default();
         let arguments = request.get("arguments").cloned().unwrap_or_else(|| json!({}));
         let id = request.get("id").cloned().unwrap_or(Value::Null);
@@ -729,7 +832,7 @@ impl SidecarPool {
             Some(result) => spawn_task(async move {
                 let result = match result.await {
                     Ok(value) => value,
-                    // Only the clipboard read can fail (`ipc.ts:388-395`).
+                    // Only the clipboard read can fail (`services::host_tools`).
                     Err(error) => Value::String(format!("Clipboard read failed: {error}")),
                 };
                 sidecar.send_side_channel(json!({ "type": "host_tool_result", "id": id, "result": result }));
@@ -747,7 +850,6 @@ impl SidecarPool {
                 });
             }
         }
-        true
     }
 
     pub(crate) fn sidecar_for_window(&self, win_id: WindowId) -> Option<Arc<dyn SidecarHandle>> {
@@ -765,7 +867,7 @@ impl SidecarPool {
     /// Send `command` to the idle, ready tab attached to `session_path`. The
     /// command is queued on that sidecar's stdin before this returns. A delivery
     /// failure resolves as a failed response carrying the error, so the caller
-    /// reports it the way the TS rejection did.
+    /// reports it like any refused command.
     ///
     /// A `compact` keeps the tab compacting until it answers, exactly like an
     /// automatic one, so nothing else is sent to the session meanwhile.
@@ -851,7 +953,7 @@ impl SidecarPool {
                     state.split_by_window.remove(&win_id);
                 }
             }
-            state.sync_full_wiring(win_id);
+            state.sync_full_wiring(win_id, out);
             out.notify.push(win_id);
             true
         })
@@ -963,7 +1065,7 @@ impl SidecarPool {
     /// as working during an agent run or compaction, and also while a user
     /// `bash` or `eval` command it issued is running. Those commands emit no
     /// agent events, so the agent run state alone would let a quit kill them
-    /// unasked; `sidecar-pool.ts` reports only the agent run state.
+    /// unasked.
     pub(crate) fn tab_inventory(&self) -> Vec<WindowTabFact> {
         self.read(|state| {
             state
@@ -1058,17 +1160,23 @@ impl SidecarPool {
             let mut state = lock(&self.inner.state);
             let entries = std::mem::take(&mut state.entries);
             *state = PoolState { next_key: state.next_key, ..PoolState::default() };
-            entries.into_iter().map(|entry| entry.sidecar.dispose()).collect()
+            entries
+                .into_iter()
+                .map(|mut entry| {
+                    entry.cancel_held();
+                    entry.sidecar.dispose()
+                })
+                .collect()
         };
         Box::pin(async move {
             futures_util::future::join_all(disposals).await;
         })
     }
 
+    /// Whether the tab forwards its full channels (it is visible in its window).
     #[cfg(test)]
-    fn wiring(&self, tab_id: &str) -> usize {
-        // TS counted "events" listeners: the light wiring is always on, full wiring adds one.
-        self.read(|state| state.entry_for_tab(tab_id).map_or(0, |entry| 1 + usize::from(entry.full_wired)))
+    fn is_full_wired(&self, tab_id: &str) -> bool {
+        self.read(|state| state.entry_for_tab(tab_id).is_some_and(|entry| entry.full_wired))
     }
 }
 
@@ -1112,7 +1220,7 @@ impl Drop for Reservation<'_> {
 }
 
 /// Ask a sidecar that just reported ready for its state; a failure or timeout
-/// marks it unhealthy so the manager restarts it (`index.ts:380-393`).
+/// marks it unhealthy so the manager restarts it.
 fn health_check(sidecar: Arc<dyn SidecarHandle>) {
     if !sidecar.has_rpc_client() {
         return;
@@ -1135,7 +1243,7 @@ fn health_check(sidecar: Arc<dyn SidecarHandle>) {
 mod tests {
     use super::*;
     use crate::bridge::Registry;
-    use crate::ports::{SidecarError, TabsPort, WindowRecord};
+    use crate::ports::{SidecarError, TabSplitAxis, TabsPort, WindowRecord};
     use crate::tabs::Tabs;
     use crate::testing::{fake_ctx_cyclic, FakeSidecar, Fakes, RecordingSink};
 
@@ -1207,13 +1315,22 @@ mod tests {
         fn statuses(&self, win_id: WindowId) -> Vec<Value> {
             self.sent(win_id, CHANNEL_TAB_STATUS).into_iter().map(|payload| payload["status"].clone()).collect()
         }
+
+        /// Every layout snapshot published from now on.
+        fn record_layouts(&self) -> Arc<Mutex<Vec<Option<PersistedTabLayout>>>> {
+            let snapshots: Arc<Mutex<Vec<Option<PersistedTabLayout>>>> = Arc::default();
+            let sink = snapshots.clone();
+            self.tabs().on_window_tabs_changed(Box::new(move |_, layout| lock(&sink).push(layout)));
+            snapshots
+        }
     }
 
-    /// Let every drain task process what was emitted (current-thread runtime).
+    /// Wait until every task is idle: the drain tasks have processed what was
+    /// emitted, and whatever they spawned has run. Every test here runs on a
+    /// paused clock (`start_paused`), which advances only once the runtime has
+    /// nothing left to run, so this timer fires exactly at quiescence.
     async fn settle() {
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 
     fn agent_events(sidecar: &FakeSidecar, types: &[&str]) {
@@ -1227,6 +1344,10 @@ mod tests {
 
     fn confirm_request(id: &str) -> Value {
         json!({ "type": "extension_ui_request", "id": id, "method": "confirm", "title": "Proceed?", "message": "ok?" })
+    }
+
+    fn host_uri_request(id: &str) -> Value {
+        json!({ "type": "host_uri_request", "id": id, "operation": "read", "url": "https://example.com" })
     }
 
     fn host_tool_call(sidecar: &FakeSidecar, id: &str) {
@@ -1245,6 +1366,11 @@ mod tests {
 
     fn disposed(sidecar: &FakeSidecar) -> bool {
         log_has(sidecar, "dispose()")
+    }
+
+    /// The real manager escalates to SIGKILL inside the future `dispose` returns.
+    fn disposal_awaited(sidecar: &FakeSidecar) -> bool {
+        log_has(sidecar, "dispose awaited")
     }
 
     fn restarts(sidecar: &FakeSidecar) -> Vec<String> {
@@ -1271,7 +1397,7 @@ mod tests {
 
     // -- session kind ---------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn threads_the_spawn_kind_through_the_factory_into_tab_status_payloads() {
         let h = harness();
         let win = h.window(1);
@@ -1297,7 +1423,7 @@ mod tests {
 
     // -- tabs -----------------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn binds_two_tabs_to_one_window_the_first_is_active() {
         let h = harness();
         let win = h.window(1);
@@ -1319,7 +1445,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn mints_a_snowflake_tabid_when_none_is_given() {
         let h = harness();
         let win = h.window(1);
@@ -1330,7 +1456,7 @@ mod tests {
         assert!(minted.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)), "{minted}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn resumes_a_session_on_first_start_when_sessionpath_is_given() {
         let h = harness();
         let win = h.window(1);
@@ -1342,7 +1468,7 @@ mod tests {
         assert_eq!(h.tabs().tabs_for_window(win)[0].session_path, Some(Some("/sessions/s.jsonl".into())));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn forwards_full_channels_only_from_the_active_tab_tab_status_from_every_tab() {
         let h = harness();
         let win = h.window(1);
@@ -1379,7 +1505,70 @@ mod tests {
         assert_eq!(h.sent(win, CHANNEL_PROMPT_RESULT), [json!({ "tabId": "tab-a", "payload": { "type": "prompt_result" } })]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn maps_each_pass_through_event_to_its_channel_from_the_visible_tab_only() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        h.acquire("/b", win, "tab-b");
+        let (a, b) = (h.sidecar(0), h.sidecar(1));
+        settle().await;
+
+        let commands = |payload: Value| SidecarEvent::CommandsUpdate(payload.as_array().cloned().unwrap_or_default());
+        type Case = (&'static str, fn(Value) -> SidecarEvent, Value);
+        let cases: [Case; 9] = [
+            (CHANNEL_SUBAGENT_FRAME, SidecarEvent::SubagentFrame, json!({ "type": "subagent_lifecycle" })),
+            (CHANNEL_LIVE_UPDATE, SidecarEvent::LiveUpdate, json!({ "type": "live_update" })),
+            (CHANNEL_MODEL_CATALOG_UPDATE, SidecarEvent::ModelCatalogUpdate, json!({ "type": "model_catalog_update" })),
+            (CHANNEL_COMMANDS_UPDATE, commands, json!([{ "name": "compact" }])),
+            (CHANNEL_CONFIG_UPDATE, SidecarEvent::ConfigUpdate, json!({ "type": "config_update" })),
+            (CHANNEL_PROMPT_RESULT, SidecarEvent::PromptResult, json!({ "type": "prompt_result" })),
+            (CHANNEL_COMMAND_OUTPUT, SidecarEvent::CommandOutput, json!({ "type": "command_output" })),
+            (CHANNEL_EXTENSION_ERROR, SidecarEvent::ExtensionError, json!({ "type": "extension_error" })),
+            (CHANNEL_SESSION_INFO_UPDATE, SidecarEvent::SessionInfoUpdate, json!({ "type": "session_info_update", "title": "Named" })),
+        ];
+        let channels: Vec<&str> = cases.iter().map(|(channel, _, _)| *channel).collect();
+        for (channel, event, payload) in cases {
+            h.clear(win);
+            b.emit(event(payload.clone()));
+            settle().await;
+            for other in &channels {
+                assert!(h.sent(win, other).is_empty(), "{channel} from the background tab reached {other}");
+            }
+            a.emit(event(payload.clone()));
+            settle().await;
+            for other in &channels {
+                let expected = if *other == channel { vec![json!({ "tabId": "tab-a", "payload": payload })] } else { Vec::new() };
+                assert_eq!(h.sent(win, other), expected, "{channel} from the visible tab, seen on {other}");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pushes_no_tab_status_or_layout_for_reports_that_change_nothing() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        let a = h.sidecar(0);
+        a.set_status(SidecarStatus::Ready);
+        settle().await;
+        h.clear(win);
+
+        // A streamed batch that leaves the run state alone is forwarded, but no snapshot is pushed.
+        agent_events(&a, &["message_update"]);
+        settle().await;
+        assert_eq!(h.sent(win, CHANNEL_EVENTS).len(), 1);
+        assert!(h.sent(win, CHANNEL_TAB_STATUS).is_empty());
+
+        // Every hydrate re-reports the attached file; only the first report is a change.
+        let snapshots = h.record_layouts();
+        h.tabs().note_session_file("tab-a", Some("/sessions/s.jsonl"));
+        h.tabs().note_session_file("tab-a", Some("/sessions/s.jsonl"));
+        assert_eq!(h.sent(win, CHANNEL_TAB_STATUS).len(), 1);
+        assert_eq!(lock(&snapshots).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn synthesizes_running_ready_per_tab_from_the_agent_event_stream() {
         let h = harness();
         let win = h.window(1);
@@ -1420,18 +1609,18 @@ mod tests {
         assert_eq!(h.tabs().tabs_for_window(win)[1].status, TabStatus::Ready);
     }
 
-    #[tokio::test]
-    async fn re_wires_forwarding_on_switch_without_duplicating_listeners() {
+    #[tokio::test(start_paused = true)]
+    async fn forwards_the_full_channels_of_whichever_tab_a_switch_activates() {
         let h = harness();
         let win = h.window(1);
         h.acquire("/a", win, "tab-a");
         h.acquire("/b", win, "tab-b");
         let (a, b) = (h.sidecar(0), h.sidecar(1));
-        // Light wiring (run tracking) is always on; full wiring adds one more.
-        assert_eq!((h.pool().wiring("tab-a"), h.pool().wiring("tab-b")), (2, 1));
+        // Every tab pushes tab:status; only the active one forwards its full channels.
+        assert_eq!((h.pool().is_full_wired("tab-a"), h.pool().is_full_wired("tab-b")), (true, false));
 
         assert!(h.tabs().set_active_tab(win, "tab-b"));
-        assert_eq!((h.pool().wiring("tab-a"), h.pool().wiring("tab-b")), (1, 2));
+        assert_eq!((h.pool().is_full_wired("tab-a"), h.pool().is_full_wired("tab-b")), (false, true));
 
         settle().await;
         h.clear(win);
@@ -1441,9 +1630,9 @@ mod tests {
         assert_eq!(h.sent(win, CHANNEL_EVENTS).len(), 1);
         assert_eq!(h.sent(win, CHANNEL_TAB_STATUS).len(), 2);
 
-        // Switching back re-arms A exactly once (one batch per emit, not two).
+        // Switching back forwards A's batches again, once per emit.
         assert!(h.tabs().set_active_tab(win, "tab-a"));
-        assert_eq!((h.pool().wiring("tab-a"), h.pool().wiring("tab-b")), (2, 1));
+        assert_eq!((h.pool().is_full_wired("tab-a"), h.pool().is_full_wired("tab-b")), (true, false));
         h.clear(win);
         agent_events(&a, &["agent_end"]);
         settle().await;
@@ -1451,13 +1640,13 @@ mod tests {
 
         // Re-setting the already-active tab is a no-op.
         assert!(h.tabs().set_active_tab(win, "tab-a"));
-        assert_eq!(h.pool().wiring("tab-a"), 2);
+        assert!(h.pool().is_full_wired("tab-a"));
         // Foreign and unknown tabs are refused.
         assert!(!h.tabs().set_active_tab(WindowId(2), "tab-a"));
         assert!(!h.tabs().set_active_tab(win, "nope"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn forwards_exactly_two_visible_sessions_and_persists_their_split_geometry() {
         let h = harness();
         let win = h.window(1);
@@ -1466,9 +1655,9 @@ mod tests {
         h.acquire("/c", win, "tab-c");
         let (a, b, c) = (h.sidecar(0), h.sidecar(1), h.sidecar(2));
 
-        let split = IpcTabViewSplit { axis: crate::ports::TabSplitAxis::Columns, first_tab_id: "tab-a".into(), second_tab_id: "tab-b".into(), ratio: 0.65 };
+        let split = IpcTabViewSplit { axis: TabSplitAxis::Columns, first_tab_id: "tab-a".into(), second_tab_id: "tab-b".into(), ratio: 0.65 };
         assert!(h.tabs().set_tab_view(win, "tab-b", &["tab-a".into(), "tab-b".into()], Some(split)));
-        assert_eq!([h.pool().wiring("tab-a"), h.pool().wiring("tab-b"), h.pool().wiring("tab-c")], [2, 2, 1]);
+        assert_eq!([h.pool().is_full_wired("tab-a"), h.pool().is_full_wired("tab-b"), h.pool().is_full_wired("tab-c")], [true, true, false]);
         settle().await;
         h.clear(win);
         for sidecar in [&a, &b, &c] {
@@ -1486,14 +1675,19 @@ mod tests {
             json!({ "axis": "columns", "firstIndex": 0, "secondIndex": 1, "ratio": 0.65 })
         );
         assert!(!h.tabs().set_tab_view(win, "tab-b", &["tab-a".into(), "tab-b".into(), "tab-c".into()], None));
+        // The focused tab must be one of the visible ones, and a split needs two distinct panes.
+        assert!(!h.tabs().set_tab_view(win, "tab-c", &["tab-a".into(), "tab-b".into()], None));
+        let same_pane = IpcTabViewSplit { axis: TabSplitAxis::Columns, first_tab_id: "tab-a".into(), second_tab_id: "tab-a".into(), ratio: 0.5 };
+        assert!(!h.tabs().set_tab_view(win, "tab-a", &["tab-a".into(), "tab-b".into()], Some(same_pane)));
+        assert_eq!(h.tabs().active_tab_for_window(win).as_deref(), Some("tab-b"));
 
         assert!(h.tabs().release_tab("tab-b"));
         assert_eq!(h.tabs().active_tab_for_window(win).as_deref(), Some("tab-a"));
         assert!(h.tabs().tab_layout_for_window(win).unwrap().split.is_none());
-        assert_eq!((h.pool().wiring("tab-a"), h.pool().wiring("tab-c")), (2, 1));
+        assert_eq!((h.pool().is_full_wired("tab-a"), h.pool().is_full_wired("tab-c")), (true, false));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn caches_session_meta_per_tab_and_includes_it_in_tab_status_and_get_tabs() {
         let h = harness();
         let win = h.window(1);
@@ -1524,7 +1718,7 @@ mod tests {
         assert_eq!(h.sent(win, CHANNEL_TAB_STATUS), [ready]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn spawns_only_the_tabs_a_restored_layout_shows_then_wakes_a_sleeping_tab_on_demand() {
         let h = harness();
         let win = h.window(1);
@@ -1557,7 +1751,7 @@ mod tests {
         assert_eq!(restarts(&h.sidecar(0)).len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn labels_a_sleeping_tab_with_the_title_its_session_last_had() {
         let h = harness();
         let win = h.window(1);
@@ -1581,7 +1775,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn restores_tab_order_sessions_and_the_persisted_active_tab_every_tab_as_an_agent() {
         let h = harness();
         let win = h.window(1);
@@ -1611,7 +1805,7 @@ mod tests {
         assert_eq!(kinds, [json!("agent"), json!("agent")]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn forwards_the_status_a_deferred_tab_reports_as_it_is_shown() {
         let h = harness();
         let win = h.window(1);
@@ -1633,40 +1827,87 @@ mod tests {
         assert_eq!(h.sent(win, CHANNEL_SIDECAR_STATUS), [json!({ "tabId": sleeping, "payload": { "status": "starting", "cwd": "/a" } })]);
     }
 
-    #[tokio::test]
-    async fn publishes_durable_layout_changes_after_tab_session_cwd_and_active_mutations() {
+    #[tokio::test(start_paused = true)]
+    async fn publishes_a_restored_layout_once_it_is_complete_never_partway() {
         let h = harness();
         let win = h.window(1);
-        let snapshots: Arc<Mutex<Vec<Option<PersistedTabLayout>>>> = Arc::default();
-        let sink = snapshots.clone();
-        h.tabs().on_window_tabs_changed(Box::new(move |_, layout| lock(&sink).push(layout)));
-        let last = || serde_json::to_value(lock(&snapshots).last().cloned().flatten()).unwrap();
-
-        h.acquire_with_session("/a", win, "tab-a", "/sessions/a.jsonl");
-        h.tabs().acquire(AcquireOptions { tab_id: Some("tab-b".into()), kind: SessionKind::Chat, ..AcquireOptions::new("/b", win) });
-        h.tabs().set_active_tab(win, "tab-b");
-        h.tabs().note_session_file("tab-b", Some("/sessions/b.jsonl"));
-        h.tabs().adopt_session_cwd("tab-b", "/moved");
-
-        assert_eq!(
-            last(),
-            json!({
+        let snapshots = h.record_layouts();
+        h.tabs().restore_layout(
+            win,
+            layout(json!({
                 "version": 1, "activeIndex": 1,
-                "tabs": [{ "cwd": "/a", "kind": "agent", "sessionPath": "/sessions/a.jsonl" }, { "cwd": "/moved", "kind": "chat", "sessionPath": "/sessions/b.jsonl" }],
-            })
+                "tabs": [{ "cwd": "/a", "kind": "agent" }, { "cwd": "/b", "kind": "agent" }, { "cwd": "/c", "kind": "agent" }],
+            })),
         );
 
-        h.tabs().release_tab("tab-b");
-        assert_eq!(last(), json!({ "version": 1, "activeIndex": 0, "tabs": [{ "cwd": "/a", "kind": "agent", "sessionPath": "/sessions/a.jsonl" }] }));
+        // A partial snapshot saved mid-restore would lose the tabs not acquired yet.
+        let published = lock(&snapshots).clone();
+        assert_eq!(published.len(), 1, "{published:?}");
+        let layout = published[0].clone().unwrap();
+        assert_eq!((layout.tabs.len(), layout.active_index), (3, 1));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn shows_the_first_restored_tab_when_the_saved_active_tab_is_gone() {
+        let h = harness();
+        let win = h.window(1);
+        h.tabs().restore_layout(win, layout(json!({ "version": 1, "activeIndex": 5, "tabs": [{ "cwd": "/a", "kind": "agent" }, { "cwd": "/b", "kind": "agent" }] })));
+
+        let first = h.tabs().tabs_for_window(win)[0].tab_id.clone();
+        assert_eq!(h.tabs().active_tab_for_window(win), Some(first));
+        assert_eq!(h.sidecars().iter().map(|sidecar| started(sidecar)).collect::<Vec<_>>(), [true, false]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publishes_one_layout_snapshot_for_each_durable_change() {
+        let h = harness();
+        let win = h.window(1);
+        let snapshots = h.record_layouts();
+        // Quit skips persisting, so whatever a change did not publish is lost at the next launch.
+        let publish = |change: &dyn Fn()| -> Value {
+            lock(&snapshots).clear();
+            change();
+            let published = std::mem::take(&mut *lock(&snapshots));
+            assert_eq!(published.len(), 1, "one snapshot per change: {published:?}");
+            serde_json::to_value(&published[0]).unwrap()
+        };
+        let tab_a = json!({ "cwd": "/a", "kind": "agent", "sessionPath": "/sessions/a.jsonl" });
+
+        let acquired = publish(&|| {
+            h.acquire_with_session("/a", win, "tab-a", "/sessions/a.jsonl");
+        });
+        assert_eq!(acquired, json!({ "version": 1, "activeIndex": 0, "tabs": [tab_a] }));
+        let acquired = publish(&|| {
+            h.tabs().acquire(AcquireOptions { tab_id: Some("tab-b".into()), kind: SessionKind::Chat, ..AcquireOptions::new("/b", win) });
+        });
+        assert_eq!(acquired["tabs"][1], json!({ "cwd": "/b", "kind": "chat" }));
+        let switched = publish(&|| {
+            h.tabs().set_active_tab(win, "tab-b");
+        });
+        assert_eq!(switched["activeIndex"], json!(1));
+        let attached = publish(&|| h.tabs().note_session_file("tab-b", Some("/sessions/b.jsonl")));
+        assert_eq!(attached["tabs"][1]["sessionPath"], json!("/sessions/b.jsonl"));
+        let moved = publish(&|| {
+            h.tabs().adopt_session_cwd("tab-b", "/moved");
+        });
+        assert_eq!(
+            moved,
+            json!({
+                "version": 1, "activeIndex": 1,
+                "tabs": [tab_a, { "cwd": "/moved", "kind": "chat", "sessionPath": "/sessions/b.jsonl" }],
+            })
+        );
+        let released = publish(&|| {
+            h.tabs().release_tab("tab-b");
+        });
+        assert_eq!(released, json!({ "version": 1, "activeIndex": 0, "tabs": [tab_a] }));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn marks_only_the_untargeted_startup_tab_as_disposable_and_clears_it_on_first_run() {
         let h = harness();
         let win = h.window(1);
-        let snapshots: Arc<Mutex<Vec<Option<PersistedTabLayout>>>> = Arc::default();
-        let sink = snapshots.clone();
-        h.tabs().on_window_tabs_changed(Box::new(move |_, layout| lock(&sink).push(layout)));
+        let snapshots = h.record_layouts();
 
         h.tabs().acquire(AcquireOptions {
             tab_id: Some("tab-idle".into()),
@@ -1689,7 +1930,7 @@ mod tests {
         assert!(last.tabs[0].placeholder.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn releases_a_tab_disposed_pool_shrinks_active_falls_back_to_a_sibling() {
         let h = harness();
         let win = h.window(1);
@@ -1703,7 +1944,9 @@ mod tests {
         assert_eq!(h.tabs().size(), 1);
         assert!(same(&h.tabs().sidecar_for_window(win).unwrap(), &b));
         assert_eq!(h.tabs().active_tab_for_window(win).as_deref(), Some("tab-b"));
-        assert_eq!(h.pool().wiring("tab-b"), 2);
+        assert!(h.pool().is_full_wired("tab-b"));
+        settle().await;
+        assert!(disposal_awaited(&a));
 
         // An unknown tab is a no-op; closing the last tab leaves the window tab-less.
         assert!(!h.tabs().release_tab("tab-a"));
@@ -1715,7 +1958,7 @@ mod tests {
         assert!(h.tabs().tabs_for_window(win).is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn counts_tabs_across_windows_against_the_cap() {
         let h = harness_with_max(2);
         let (first, second) = (h.window(1), h.window(2));
@@ -1732,7 +1975,48 @@ mod tests {
         assert!(h.acquire("/c", second, "tab-c").is_some());
     }
 
-    #[tokio::test]
+    #[test]
+    fn gives_the_slot_back_when_acquire_finds_no_app_context() {
+        let pool = SidecarPool::new(Weak::new(), 1);
+        assert!(pool.acquire(AcquireOptions::new("/a", WindowId(1))).is_none());
+        assert_eq!(pool.size(), 0);
+        assert!(!pool.at_cap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn holds_the_slot_while_the_sidecar_is_created_so_a_racing_acquire_is_refused() {
+        let h = harness_with_max(1);
+        let win = h.window(1);
+        // What the racing acquire saw: the pool size, and the tab it got.
+        type Seen = Option<(usize, Option<String>)>;
+        let seen: Arc<Mutex<Seen>> = Arc::default();
+        let (ctx, record) = (Arc::downgrade(&h.ctx), seen.clone());
+        *lock(&h.fakes.omp.on_new_sidecar) = Some(Box::new(move |_| {
+            // The pool lock is free here, exactly as when a second spawn races this one.
+            let ctx = ctx.upgrade().unwrap();
+            let racing = ctx.tabs.acquire(AcquireOptions::new("/b", WindowId(2)));
+            *lock(&record) = Some((ctx.tabs.size(), racing));
+        }));
+
+        assert!(h.acquire("/a", win, "tab-a").is_some());
+        assert_eq!(*lock(&seen), Some((1, None)));
+        assert_eq!((h.tabs().size(), h.sidecars().len()), (1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_the_slot_back_when_creating_the_sidecar_panics() {
+        let h = harness_with_max(1);
+        let win = h.window(1);
+        *lock(&h.fakes.omp.on_new_sidecar) = Some(Box::new(|_| panic!("the sidecar could not be created")));
+
+        // tab:spawn and window spawns survive such a panic, so the pool must too.
+        let acquired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.acquire("/a", win, "tab-a")));
+        assert!(acquired.is_err());
+        assert_eq!(h.tabs().size(), 0);
+        assert!(h.acquire("/a", win, "tab-a").is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn releases_every_tab_of_a_closed_window() {
         let h = harness();
         crate::tabs::install(&h.ctx);
@@ -1753,9 +2037,74 @@ mod tests {
         assert_eq!(h.sent(second, CHANNEL_SIDECAR_STATUS).len(), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn closing_a_window_spawns_none_of_its_sleeping_tabs() {
+        let h = harness();
+        crate::tabs::install(&h.ctx);
+        let win = h.window(1);
+        h.tabs().restore_layout(
+            win,
+            layout(json!({
+                "version": 1, "activeIndex": 0,
+                "tabs": [{ "cwd": "/a", "kind": "agent" }, { "cwd": "/b", "kind": "agent", "sessionPath": "/sessions/b.jsonl" }, { "cwd": "/c", "kind": "agent" }],
+            })),
+        );
+        assert!(started(&h.sidecar(0)));
+
+        h.fakes.desktop.close(win);
+        for index in [1, 2] {
+            let sidecar = h.sidecar(index);
+            assert!(!started(&sidecar) && restarts(&sidecar).is_empty(), "sleeping tab {index} was spawned by the close");
+            assert!(disposed(&sidecar));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hands_the_focus_to_the_other_visible_pane_when_the_focused_pane_closes() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        h.acquire("/b", win, "tab-b");
+        h.acquire("/c", win, "tab-c");
+        let split = IpcTabViewSplit { axis: TabSplitAxis::Columns, first_tab_id: "tab-b".into(), second_tab_id: "tab-c".into(), ratio: 0.5 };
+        assert!(h.tabs().set_tab_view(win, "tab-c", &["tab-b".into(), "tab-c".into()], Some(split)));
+
+        assert!(h.tabs().release_tab("tab-c"));
+        // The pane still on screen takes the focus, not the oldest tab of the window.
+        assert_eq!(h.tabs().active_tab_for_window(win).as_deref(), Some("tab-b"));
+        assert!(h.pool().is_full_wired("tab-b"));
+        assert!(!h.pool().is_full_wired("tab-a"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drops_the_split_when_its_first_pane_closes() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        h.acquire("/b", win, "tab-b");
+        let split = IpcTabViewSplit { axis: TabSplitAxis::Rows, first_tab_id: "tab-a".into(), second_tab_id: "tab-b".into(), ratio: 0.5 };
+        assert!(h.tabs().set_tab_view(win, "tab-b", &["tab-a".into(), "tab-b".into()], Some(split)));
+
+        assert!(h.tabs().release_tab("tab-a"));
+        assert!(h.tabs_json(win).as_array().unwrap().iter().all(|tab| tab.get("split").is_none()), "{}", h.tabs_json(win));
+        assert!(h.tabs().tab_layout_for_window(win).unwrap().split.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_with_only_sleeping_tabs_resolves_to_its_first_tab() {
+        let h = harness();
+        let win = h.window(1);
+        h.tabs().acquire(AcquireOptions { tab_id: Some("tab-a".into()), defer_start: true, ..AcquireOptions::new("/a", win) });
+
+        // A deferred tab claims no active slot, yet the window's commands and cwd still reach it.
+        assert!(h.tabs().active_tab_for_window(win).is_none());
+        assert!(same(&h.tabs().sidecar_for_window(win).unwrap(), &h.sidecar(0)));
+        assert_eq!(h.tabs().cwd_for(Caller::main(win), None).as_deref(), Some("/a"));
+    }
+
     // -- session ownership ---------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn routes_session_mutations_only_to_an_idle_attached_tab() {
         let h = harness();
         let win = h.window(1);
@@ -1775,7 +2124,7 @@ mod tests {
         assert!(h.tabs().command_for_idle_session("/sessions/s.jsonl", json!({ "type": "drop_session" })).await.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn blocks_session_mutations_while_automatic_compaction_is_in_flight() {
         let h = harness();
         let win = h.window(1);
@@ -1795,7 +2144,7 @@ mod tests {
         assert_eq!(response.and_then(|response| response["success"].as_bool()), Some(true));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn treats_a_compact_sent_to_an_idle_tab_as_compacting_until_it_answers() {
         let h = harness();
         let win = h.window(1);
@@ -1820,7 +2169,7 @@ mod tests {
         assert_eq!(requests, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn sends_a_compact_to_an_idle_tab_with_the_long_running_compaction_timeout() {
         let h = harness();
         let win = h.window(1);
@@ -1837,7 +2186,84 @@ mod tests {
         assert_eq!(requests, [format!("request({compact}, Some(660000))"), format!("request({get_state}, None)")]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_during_an_automatic_compaction_clears_the_compacting_flag() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire_with_session("/a", win, "tab-a", "/sessions/s.jsonl");
+        let sidecar = h.sidecar(0);
+        sidecar.set_status(SidecarStatus::Ready);
+        agent_events(&sidecar, &["auto_compaction_start"]);
+        settle().await;
+        assert_eq!(h.tabs().tabs_for_window(win)[0].compacting, Some(true));
+
+        // The crash killed the compaction: the session is free again once the sidecar is back.
+        sidecar.set_status(SidecarStatus::Restarting);
+        sidecar.set_status(SidecarStatus::Ready);
+        settle().await;
+        assert_eq!(h.tabs().tabs_for_window(win)[0].compacting, None);
+        assert!(!h.tabs().any_in_flight());
+        assert!(h.tabs().command_for_idle_session("/sessions/s.jsonl", json!({ "type": "drop_session" })).await.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_compact_answered_after_a_restart_leaves_the_reset_flag_alone() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire_with_session("/a", win, "tab-a", "/sessions/s.jsonl");
+        let sidecar = h.sidecar(0);
+        sidecar.set_status(SidecarStatus::Ready);
+        settle().await;
+
+        let pending = h.tabs().command_for_idle_session("/sessions/s.jsonl", json!({ "type": "compact" }));
+        assert_eq!(h.tabs().tabs_for_window(win)[0].compacting, Some(true));
+        sidecar.set_status(SidecarStatus::Restarting);
+        sidecar.set_status(SidecarStatus::Ready);
+        settle().await;
+        assert_eq!(h.tabs().tabs_for_window(win)[0].compacting, None);
+
+        // The late answer must not report a compaction that never finished.
+        pending.await;
+        assert_eq!(h.tabs().tabs_for_window(win)[0].compacting, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refuses_an_idle_session_command_before_the_tab_is_ready_or_without_an_owner() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire_with_session("/a", win, "tab-a", "/sessions/s.jsonl");
+        let sidecar = h.sidecar(0);
+        report_starting(&sidecar);
+        settle().await;
+
+        // A starting process already answers RPC, but it is still reading the session.
+        assert!(sidecar.has_rpc_client());
+        assert!(h.tabs().command_for_idle_session("/sessions/s.jsonl", json!({ "type": "drop_session" })).await.is_none());
+        sidecar.set_status(SidecarStatus::Ready);
+        settle().await;
+        assert!(h.tabs().command_for_idle_session("/sessions/other.jsonl", json!({ "type": "drop_session" })).await.is_none());
+        assert!(!sidecar.log.calls().iter().any(|call| call.starts_with("request(")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answers_a_failed_delivery_with_a_failed_response_carrying_the_error() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire_with_session("/a", win, "tab-a", "/sessions/s.jsonl");
+        let sidecar = h.sidecar(0);
+        sidecar.set_status(SidecarStatus::Ready);
+        settle().await;
+        sidecar.responses.lock().unwrap().push(Err(SidecarError::Timeout { timeout_ms: 8000, command_type: "drop_session".into() }));
+
+        // sessions:delete removes the file only on success, so a lost delete must not read as one.
+        let response = h.tabs().command_for_idle_session("/sessions/s.jsonl", json!({ "type": "drop_session" })).await;
+        assert_eq!(
+            response,
+            Some(json!({ "type": "response", "command": "drop_session", "success": false, "error": "RPC timeout (8000ms): drop_session" }))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn reports_a_session_as_live_only_while_some_process_holds_it() {
         let h = harness();
         let win = h.window(1);
@@ -1875,7 +2301,7 @@ mod tests {
         assert!(!h.tabs().session_owner_is_live("/sessions/s.jsonl"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn registers_the_owner_at_acquire_with_sessionpath_and_unregisters_on_release() {
         let h = harness();
         let win = h.window(1);
@@ -1890,7 +2316,7 @@ mod tests {
         assert!(h.tabs().session_owner("/sessions/s.jsonl").is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn learns_the_file_from_notesessionfile_get_state_switch_session_reports() {
         let h = harness();
         let win = h.window(1);
@@ -1919,7 +2345,7 @@ mod tests {
         assert!(h.tabs().session_owner("/sessions/x.jsonl").is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn keeps_the_acquire_time_registration_through_first_attach_but_drops_it_on_a_sessionid_change() {
         let h = harness();
         let win = h.window(1);
@@ -1929,6 +2355,11 @@ mod tests {
 
         // First attach: the resumed session reports its id and the registration stays.
         session_info(&a, json!({ "sessionId": "sess-1", "title": "Resumed" }));
+        settle().await;
+        assert_eq!(h.tabs().session_owner("/sessions/s.jsonl"), owner);
+
+        // A rename that repeats the unchanged id is no session change either.
+        session_info(&a, json!({ "sessionId": "sess-1", "title": "Renamed" }));
         settle().await;
         assert_eq!(h.tabs().session_owner("/sessions/s.jsonl"), owner);
 
@@ -1946,7 +2377,7 @@ mod tests {
         assert_eq!(h.tabs().session_owner("/sessions/s.jsonl"), owner);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn only_the_current_owner_clears_a_mapping() {
         let h = harness();
         let win = h.window(1);
@@ -1963,7 +2394,7 @@ mod tests {
         assert_eq!(h.tabs().session_owner("/sessions/s.jsonl"), owner);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn foreignsessionowner_blocks_only_foreign_attaches() {
         let h = harness();
         let win = h.window(1);
@@ -1984,7 +2415,7 @@ mod tests {
         assert!(h.tabs().foreign_session_owner(Some("tab-b"), "/sessions/s.jsonl").is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unregisters_owners_when_a_window_closes() {
         let h = harness();
         crate::tabs::install(&h.ctx);
@@ -1997,7 +2428,7 @@ mod tests {
 
     // -- session cwd tracking --------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn adoptsessioncwd_re_roots_the_tab_and_pushes_the_live_cwd_over_tab_status() {
         let h = harness();
         let win = h.window(1);
@@ -2024,7 +2455,7 @@ mod tests {
 
     // -- request-origin routing ------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn does_not_retain_fire_and_forget_extension_ui_updates() {
         let h = harness();
         let win = h.window(1);
@@ -2038,7 +2469,7 @@ mod tests {
         assert!(!h.tabs().route_side_channel("update-1", json!({ "type": "extension_ui_response", "id": "update-1" }), true));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn routes_an_extension_ui_response_to_the_raising_sidecar_even_after_a_tab_switch() {
         let h = harness();
         let win = h.window(1);
@@ -2062,7 +2493,7 @@ mod tests {
         assert!(!h.tabs().route_side_channel("req-1", response, true));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn routes_host_uri_results_to_the_origin_sidecar() {
         let h = harness();
         let win = h.window(1);
@@ -2082,7 +2513,7 @@ mod tests {
         assert!(b.side_channel.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn keeps_the_route_across_non_final_host_tool_updates_and_consumes_it_on_the_result() {
         let h = harness();
         let win = h.window(1);
@@ -2109,7 +2540,7 @@ mod tests {
         assert!(!h.tabs().route_side_channel("tool-1", result, true));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn does_not_track_host_tools_answered_inline() {
         let h = harness();
         let win = h.window(1);
@@ -2125,7 +2556,7 @@ mod tests {
         assert!(!h.tabs().route_side_channel("tool-inline", json!({ "type": "host_tool_result", "id": "tool-inline" }), true));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drops_pending_routes_when_the_owning_tab_is_released() {
         let h = harness();
         let win = h.window(1);
@@ -2136,15 +2567,201 @@ mod tests {
         a.emit(SidecarEvent::ExtensionUi(confirm_request("req-doomed")));
         settle().await;
         assert!(h.tabs().release_tab("tab-a"));
-        // A late response falls back instead of writing to a disposed sidecar.
+        // The route goes with the tab, rather than lingering until a late response finds it stale…
+        assert!(h.pool().read(|state| state.request_owners.is_empty()));
+        // …so a late response falls back instead of writing to a disposed sidecar.
         assert!(!h.tabs().route_side_channel("req-doomed", json!({ "type": "extension_ui_response", "id": "req-doomed" }), true));
         assert!(a.side_channel.lock().unwrap().is_empty());
         assert!(b.side_channel.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn blocking_ui_methods_match_the_renderer_s_list() {
+        let source = include_str!("../../../src/shared/rpc-types.ts");
+        let start = source.find("export const BLOCKING_UI_METHODS").expect("BLOCKING_UI_METHODS in rpc-types.ts");
+        let body = &source[start..];
+        let body = &body[body.find("= {").unwrap() + 3..body.find("};").unwrap()];
+        let methods: Vec<&str> = body.split(',').map(str::trim).filter(|item| !item.is_empty()).map(|item| item.trim_end_matches(": true")).collect();
+        assert_eq!(methods, BLOCKING_UI_METHODS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn holds_a_background_tab_s_requests_until_the_tab_is_shown() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        h.acquire("/b", win, "tab-b");
+        let b = h.sidecar(1);
+        settle().await;
+        h.clear(win);
+
+        b.emit(SidecarEvent::ExtensionUi(confirm_request("req-b")));
+        b.emit(SidecarEvent::HostUriRequest(host_uri_request("uri-b")));
+        host_tool_call(&b, "tool-b");
+        // A fire-and-forget update from a background tab is dropped, not held.
+        b.emit(SidecarEvent::ExtensionUi(json!({ "type": "extension_ui_request", "id": "update-b", "method": "set_editor_text", "text": "draft" })));
+        settle().await;
+        // Nothing pops up over the tab the user is looking at, and nothing is routed yet.
+        for channel in [CHANNEL_EXTENSION_UI, CHANNEL_HOST_URI_REQUEST, CHANNEL_HOST_TOOL_CALL] {
+            assert!(h.sent(win, channel).is_empty(), "{channel} forwarded from a background tab");
+        }
+        assert!(!h.fakes.services.log.calls().iter().any(|call| call.starts_with("execute_host_tool(")));
+        assert!(h.pool().read(|state| state.request_owners.is_empty()));
+
+        // Shown at last: each request reaches the window once, and its answer reaches tab-b's sidecar.
+        assert!(h.tabs().set_active_tab(win, "tab-b"));
+        settle().await;
+        assert_eq!(h.sent(win, CHANNEL_EXTENSION_UI), [json!({ "tabId": "tab-b", "request": confirm_request("req-b") })]);
+        assert_eq!(h.sent(win, CHANNEL_HOST_URI_REQUEST), [json!({ "request": host_uri_request("uri-b") })]);
+        let tool_calls = h.sent(win, CHANNEL_HOST_TOOL_CALL);
+        assert_eq!((tool_calls.len(), tool_calls[0]["request"]["id"].clone()), (1, json!("tool-b")));
+        let answers = [
+            ("req-b", json!({ "type": "extension_ui_response", "id": "req-b", "confirmed": true })),
+            ("uri-b", json!({ "type": "host_uri_result", "id": "uri-b", "content": "data" })),
+            ("tool-b", json!({ "type": "host_tool_result", "id": "tool-b", "result": "done" })),
+        ];
+        for (id, answer) in &answers {
+            assert!(h.tabs().route_side_channel(id, answer.clone(), true), "{id} has no route");
+        }
+        assert_eq!(*b.side_channel.lock().unwrap(), answers.map(|(_, answer)| answer));
+
+        // Hidden and shown again, the tab forwards nothing twice.
+        h.tabs().set_active_tab(win, "tab-a");
+        h.tabs().set_active_tab(win, "tab-b");
+        settle().await;
+        assert_eq!(h.sent(win, CHANNEL_EXTENSION_UI).len() + h.sent(win, CHANNEL_HOST_URI_REQUEST).len() + h.sent(win, CHANNEL_HOST_TOOL_CALL).len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runs_a_background_tab_s_gui_host_tool_once_the_tab_is_shown() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        h.acquire("/b", win, "tab-b");
+        let b = h.sidecar(1);
+        h.fakes.services.host_tools.lock().unwrap().insert("gui_tool".into(), Ok(json!("inline")));
+
+        host_tool_call(&b, "tool-inline");
+        settle().await;
+        assert!(b.side_channel.lock().unwrap().is_empty());
+
+        assert!(h.tabs().set_active_tab(win, "tab-b"));
+        settle().await;
+        assert_eq!(*b.side_channel.lock().unwrap(), [json!({ "type": "host_tool_result", "id": "tool-inline", "result": "inline" })]);
+        assert!(h.sent(win, CHANNEL_HOST_TOOL_CALL).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancels_the_requests_a_background_tab_still_holds_when_it_closes() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        h.acquire("/b", win, "tab-b");
+        let b = h.sidecar(1);
+        b.emit(SidecarEvent::ExtensionUi(confirm_request("req-b")));
+        b.emit(SidecarEvent::HostUriRequest(host_uri_request("uri-b")));
+        host_tool_call(&b, "tool-b");
+        settle().await;
+
+        assert!(h.tabs().release_tab("tab-b"));
+        assert_eq!(
+            *b.side_channel.lock().unwrap(),
+            [
+                json!({ "type": "extension_ui_response", "id": "req-b", "cancelled": true }),
+                json!({ "type": "host_uri_result", "id": "uri-b", "error": REQUEST_TAB_CLOSED }),
+                json!({ "type": "host_tool_result", "id": "tool-b", "error": REQUEST_TAB_CLOSED }),
+            ]
+        );
+        // The answers go out before the process is told to stop.
+        let calls = b.log.calls();
+        let answered = calls.iter().position(|call| call.starts_with("send_side_channel(")).unwrap();
+        assert!(answered < calls.iter().position(|call| call == "dispose()").unwrap());
+        assert!(h.sent(win, CHANNEL_EXTENSION_UI).is_empty());
+
+        // Quitting answers a background tab's held request the same way.
+        h.acquire("/c", win, "tab-c");
+        let c = h.sidecar(2);
+        c.emit(SidecarEvent::ExtensionUi(confirm_request("req-c")));
+        settle().await;
+        h.tabs().dispose_all().await;
+        assert_eq!(*c.side_channel.lock().unwrap(), [json!({ "type": "extension_ui_response", "id": "req-c", "cancelled": true })]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forgets_a_held_request_the_sidecar_withdraws_or_that_died_with_a_restart() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        h.acquire("/b", win, "tab-b");
+        let b = h.sidecar(1);
+        b.set_status(SidecarStatus::Ready);
+
+        // The sidecar withdraws one of two held requests (its timeout ran out, say).
+        b.emit(SidecarEvent::ExtensionUi(confirm_request("req-1")));
+        b.emit(SidecarEvent::ExtensionUi(confirm_request("req-2")));
+        b.emit(SidecarEvent::ExtensionUi(json!({ "type": "extension_ui_request", "id": "cancel-1", "method": "cancel", "targetId": "req-1" })));
+        settle().await;
+        assert!(h.tabs().set_active_tab(win, "tab-b"));
+        settle().await;
+        assert_eq!(h.sent(win, CHANNEL_EXTENSION_UI), [json!({ "tabId": "tab-b", "request": confirm_request("req-2") })]);
+
+        // A request held when the process restarts died with it.
+        assert!(h.tabs().set_active_tab(win, "tab-a"));
+        b.emit(SidecarEvent::ExtensionUi(confirm_request("req-3")));
+        b.set_status(SidecarStatus::Restarting);
+        b.set_status(SidecarStatus::Ready);
+        settle().await;
+        assert!(h.tabs().set_active_tab(win, "tab-b"));
+        settle().await;
+        assert_eq!(h.sent(win, CHANNEL_EXTENSION_UI).len(), 1);
+        h.tabs().release_tab("tab-b");
+        assert!(b.side_channel.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn withdraws_a_request_the_window_already_shows_after_its_tab_went_to_the_background() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        h.acquire("/b", win, "tab-b");
+        let b = h.sidecar(1);
+        assert!(h.tabs().set_active_tab(win, "tab-b"));
+        b.emit(SidecarEvent::ExtensionUi(confirm_request("req-b")));
+        settle().await;
+        assert!(h.tabs().set_active_tab(win, "tab-a"));
+
+        // The dialog's timeout runs out while the user looks at another tab.
+        let cancel = json!({ "type": "extension_ui_request", "id": "cancel-b", "method": "cancel", "targetId": "req-b" });
+        b.emit(SidecarEvent::ExtensionUi(cancel.clone()));
+        settle().await;
+        assert_eq!(
+            h.sent(win, CHANNEL_EXTENSION_UI),
+            [json!({ "tabId": "tab-b", "request": confirm_request("req-b") }), json!({ "tabId": "tab-b", "request": cancel })]
+        );
+        // Nobody answers a withdrawn request, so its route goes too.
+        assert!(h.pool().read(|state| state.request_owners.is_empty()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keeps_a_held_request_through_a_failed_health_check() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        h.acquire("/b", win, "tab-b");
+        let b = h.sidecar(1);
+        b.set_status(SidecarStatus::Ready);
+        b.emit(SidecarEvent::ExtensionUi(confirm_request("req-b")));
+        // The process is still running and still waiting for the answer.
+        b.set_status(SidecarStatus::Error);
+        settle().await;
+        assert!(h.tabs().set_active_tab(win, "tab-b"));
+        settle().await;
+        assert_eq!(h.sent(win, CHANNEL_EXTENSION_UI), [json!({ "tabId": "tab-b", "request": confirm_request("req-b") })]);
+    }
+
     // -- quit inventory ----------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reports_every_live_tab_s_in_flight_run_across_windows_and_drops_released_tabs() {
         let h = harness();
         let (first, second) = (h.window(1), h.window(2));
@@ -2192,9 +2809,24 @@ mod tests {
         assert!(!h.tabs().any_in_flight());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_user_exec_guard_from_before_dispose_all_leaves_a_later_tab_alone() {
+        let h = harness();
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        let stale = h.pool().begin_user_exec("tab-a").unwrap();
+        h.tabs().dispose_all().await;
+
+        h.acquire("/c", win, "tab-c");
+        let _running = h.pool().begin_user_exec("tab-c").unwrap();
+        // The old command settles after the pool was rebuilt: tab-c's command still counts.
+        drop(stale);
+        assert_eq!(h.tabs().tab_inventory(), [WindowTabFact { window_id: win, tab_id: "tab-c".into(), in_flight: true }]);
+    }
+
     // -- factory, health check, shutdown -------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn acquire_hands_the_manager_its_spawn_options() {
         let h = harness();
         let win = h.window(1);
@@ -2203,12 +2835,14 @@ mod tests {
         assert_eq!((options.cwd.as_str(), options.kind, options.fresh), ("/work", SessionKind::Chat, true));
         assert!(options.extra_flags.is_empty());
         assert_eq!(options.resume_session_path, None);
-        // Never a system omp: the bundled binary, or an empty path the manager reports as missing.
-        let expected = paths::resolve_bundled_omp().unwrap_or_default();
-        assert_eq!(options.binary_path, expected);
+        // Never a system omp: the bundled binary at an absolute path, or an empty
+        // path the manager reports as missing. A bare `omp` would search PATH.
+        let binary = &options.binary_path;
+        let bundled = binary.is_absolute() && binary.file_name() == Some(paths::bundled_omp_filename().as_ref());
+        assert!(binary.as_os_str().is_empty() || bundled, "{}", binary.display());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_ready_health_check_marks_a_sidecar_unhealthy_when_get_state_fails() {
         let h = harness();
         crate::tabs::install(&h.ctx);
@@ -2223,7 +2857,30 @@ mod tests {
         assert!(log_has(&sidecar, "mark_unhealthy(Health check failed: no session)"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn the_ready_health_check_asks_once_per_ready_report_and_leaves_a_healthy_sidecar_alone() {
+        let h = harness();
+        crate::tabs::install(&h.ctx);
+        let win = h.window(1);
+        h.acquire("/a", win, "tab-a");
+        let sidecar = h.sidecar(0);
+        let requests = || sidecar.log.calls().into_iter().filter(|call| call.starts_with("request(")).collect::<Vec<_>>();
+        let get_state = format!("request({}, None)", json!({ "type": "get_state" }));
+
+        // The fake answers `{ "success": true }`: one check, and nothing is marked.
+        sidecar.set_status(SidecarStatus::Ready);
+        settle().await;
+        assert_eq!(requests(), std::slice::from_ref(&get_state));
+        assert!(!sidecar.log.calls().iter().any(|call| call.starts_with("mark_unhealthy(")));
+
+        // Neither another status nor a batch of agent events asks again.
+        sidecar.set_status(SidecarStatus::Starting);
+        agent_events(&sidecar, &["agent_start"]);
+        settle().await;
+        assert_eq!(requests(), [get_state]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn the_ready_health_check_reports_a_timeout() {
         let h = harness();
         crate::tabs::install(&h.ctx);
@@ -2236,7 +2893,7 @@ mod tests {
         settle().await;
         assert!(log_has(&sidecar, "mark_unhealthy(Health check timed out: RPC timeout (8000ms): get_state)"));
 
-        // A healthy answer marks nothing; without `init` there is no check at all.
+        // Without `tabs::init` the pool runs no check at all.
         let quiet = harness();
         let win = quiet.window(1);
         quiet.acquire("/a", win, "tab-a");
@@ -2245,7 +2902,7 @@ mod tests {
         assert!(!quiet.sidecar(0).log.calls().iter().any(|call| call.starts_with("request(")));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dispose_all_stops_every_sidecar_and_empties_the_pool() {
         let h = harness();
         let (first, second) = (h.window(1), h.window(2));
@@ -2253,7 +2910,7 @@ mod tests {
         h.acquire("/b", second, "tab-b");
 
         h.tabs().dispose_all().await;
-        assert!(h.sidecars().iter().all(|sidecar| disposed(sidecar)));
+        assert!(h.sidecars().iter().all(|sidecar| disposed(sidecar) && disposal_awaited(sidecar)));
         assert_eq!(h.tabs().size(), 0);
         assert!(h.tabs().tabs_for_window(first).is_empty());
         assert!(h.tabs().session_owner("/sessions/a.jsonl").is_none());

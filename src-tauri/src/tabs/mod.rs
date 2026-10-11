@@ -1,7 +1,6 @@
-//! Module `tabs`: the sidecar pool, tab routing and the tab/RPC/sidecar
-//! handlers (ports of `sidecar-pool.ts`, `tab-spawn.ts`, `snowflake.ts`, the
-//! pool factory and ready health check in `index.ts:356-399`, and the tab,
-//! RPC and sidecar handlers in `ipc.ts`).
+//! Module `tabs`: the sidecar pool (`pool`), tab spawning (`tab_spawn`), tab
+//! ids (`snowflake`), the ready health check, and the tab, RPC and sidecar IPC
+//! handlers (`ipc`).
 
 pub mod ipc;
 mod pool;
@@ -114,11 +113,11 @@ impl Tabs {
     }
 }
 
-/// `command_for_idle_session` resolves `None` exactly where TS returned `null`
+/// `command_for_idle_session` resolves `None` when no tab can take the command
 /// (no owner, a run or compaction in flight, not ready, no RPC client). A
 /// delivery failure resolves `Some({ "type": "response", "success": false,
 /// "error": <message> })`, so a caller that throws `response.error` on
-/// `!success` reports the same message the TS rejection carried.
+/// `!success` reports the delivery error.
 impl TabsPort for Tabs {
     fn as_any(&self) -> &dyn Any {
         self
