@@ -631,6 +631,25 @@ fn file_paths_from_uris<S: AsRef<str>>(uris: &[S]) -> Vec<String> {
     paths
 }
 
+/// What a WebKit permission request asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionRequestKind {
+    /// `getUserMedia`, with the devices it wants.
+    UserMedia { audio: bool, video: bool },
+    /// Any other permission (geolocation, notifications, pointer lock, …).
+    Other,
+}
+
+/// Whether a WebKit permission request is granted: only the microphone on its
+/// own. The camera, the microphone together with the camera and every other
+/// permission are denied.
+fn permission_allowed(kind: PermissionRequestKind) -> bool {
+    match kind {
+        PermissionRequestKind::UserMedia { audio: true, video: false } => true,
+        PermissionRequestKind::UserMedia { .. } | PermissionRequestKind::Other => false,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn configure_webkit(window: &WebviewWindow, spec: &WindowSpec, ctx: &Arc<AppCtx>) {
     use std::sync::Mutex;
@@ -684,9 +703,17 @@ fn configure_webkit(window: &WebviewWindow, spec: &WindowSpec, ctx: &Arc<AppCtx>
             settings.set_enable_webaudio(true);
         }
         webview.connect_permission_request(|_, request| {
-            match request.downcast_ref::<webkit2gtk::UserMediaPermissionRequest>() {
-                Some(media) if media.is_for_audio_device() && !media.is_for_video_device() => request.allow(),
-                _ => request.deny(),
+            let kind = match request.downcast_ref::<webkit2gtk::UserMediaPermissionRequest>() {
+                Some(media) => PermissionRequestKind::UserMedia {
+                    audio: media.is_for_audio_device(),
+                    video: media.is_for_video_device(),
+                },
+                None => PermissionRequestKind::Other,
+            };
+            if permission_allowed(kind) {
+                request.allow();
+            } else {
+                request.deny();
             }
             true
         });
@@ -833,10 +860,32 @@ mod tests {
         assert!(last_spec < first_security);
         assert_eq!(
             &calls[first_security..],
-            &security_calls(PathBuf::from("/profile/webview"))[..],
+            &[
+                BuilderCall::DataDirectory(PathBuf::from("/profile/webview")),
+                BuilderCall::DisableDragDropHandler,
+                BuilderCall::NavigationLock,
+                BuilderCall::NewWindowLock,
+                BuilderCall::ReloadDetach,
+                BuilderCall::DownloadHandler,
+                BuilderCall::InitializationScript,
+            ][..],
             "the security calls are the tail, in a fixed order"
         );
         assert_eq!(calls.last(), Some(&BuilderCall::InitializationScript));
+    }
+
+    #[test]
+    fn only_a_microphone_only_media_request_is_granted() {
+        let cases = [
+            (PermissionRequestKind::UserMedia { audio: true, video: false }, true),
+            (PermissionRequestKind::UserMedia { audio: true, video: true }, false),
+            (PermissionRequestKind::UserMedia { audio: false, video: true }, false),
+            (PermissionRequestKind::UserMedia { audio: false, video: false }, false),
+            (PermissionRequestKind::Other, false),
+        ];
+        for (kind, allowed) in cases {
+            assert_eq!(permission_allowed(kind), allowed, "{kind:?}");
+        }
     }
 
     #[test]
