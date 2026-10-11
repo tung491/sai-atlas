@@ -114,8 +114,7 @@ function parseTrace(file: string, source: "app" | "ollama"): Connect[] {
 		const connect: Connect = { tid, thread, time: Number(timeText), family, host, port, result: "?", source };
 		if (call.includes("<unfinished ...>")) {
 			if (!datagram) pending.set(tid, connect);
-		}
-		else connect.result = RESULT.exec(call)?.[1]?.trim() ?? "?";
+		} else connect.result = RESULT.exec(call)?.[1]?.trim() ?? "?";
 		connects.push(connect);
 	}
 	return connects;

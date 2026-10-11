@@ -14,16 +14,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $, browser } from "@wdio/globals";
-import { alive, pgrepFull, procInfo } from "./repo/e2e-tauri/outside";
-import { until } from "./repo/e2e-tauri/session";
+import { alive, pgrepFull, procInfo } from "../../outside";
+import { until } from "../../session";
 import {
-	L,
-	LANG,
-	OUT,
 	capture,
 	freshConversation,
+	L,
+	LANG,
 	modelTag,
 	now,
+	OUT,
 	oneLine,
 	record,
 	sessionState,
@@ -127,7 +127,9 @@ describe(`offline language pass (${LANG})`, () => {
 				await runSetup.click();
 				await $(WELCOME).waitForDisplayed({ timeout: 30_000 });
 			}
-			const getStarted = $(`//*[@aria-label="${L("welcome.title")}"]//button[normalize-space(.)="${L("welcome.continue")}"]`);
+			const getStarted = $(
+				`//*[@aria-label="${L("welcome.title")}"]//button[normalize-space(.)="${L("welcome.continue")}"]`,
+			);
 			await browser.waitUntil(async () => (await getStarted.isExisting()) && (await getStarted.isEnabled()), {
 				timeout: 120_000,
 				timeoutMsg: "Get started never became enabled",

@@ -8,6 +8,10 @@
 # --lang vi runs the Vietnamese pass (offline-check/offline-vi.e2e.ts) instead of
 # the default English check: the app is set to Vietnamese through its settings file.
 #
+# The container mounts this checkout at /repo and runs the harness from
+# e2e-tauri/audit/offline-check/ in place; --deb defaults to the newest .deb of
+# this checkout's Linux target.
+#
 # Network: the app container runs with --network none (only `lo`). A relay
 # container on host networking listens on a Unix socket in a shared temp dir
 # and connects each client to the host's 127.0.0.1:11434 and nowhere else; the
@@ -18,7 +22,7 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 tools=$here/offline-check
-worktree=${OFFLINE_WORKTREE:-/home/tung491/WORK/worktrees/rebrand-integration}
+worktree=$(cd "$here/../.." && pwd)
 smoke_image=sai-atlas-tauri-deb-smoke
 image=sai-atlas-offline-check
 container=sai-atlas-offline-check
@@ -83,7 +87,6 @@ docker run --rm --init --name "$container" \
 	-e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -e OFFLINE_ACTION_TIMEOUT_MS -e OFFLINE_LANG="$([[ $lang == vi ]] && echo vi)" \
 	-v "$worktree:/repo" \
 	-v "$deb:/tmp/sai-atlas.deb:ro" \
-	-v "$tools:/tools:ro" \
 	-v "$sock_dir:/relay" \
 	-v "$out:/out" \
 	"$image" || status=$?

@@ -19,6 +19,10 @@
  *
  * The installed-package smoke (e2e-tauri/packaged-smoke.e2e.ts) drives a build
  * without test hooks and never runs here; `wdio.packaged.conf.ts` runs it.
+ * `OMP_E2E_NO_SIDECAR=1` also leaves out the specs that run the compiled sidecar
+ * `resources/omp` (`bun run build:omp`) instead of the fixture: real-core and
+ * deep-audit. CI's e2e-tauri job sets it, because a clean clone has no monorepo
+ * to build that sidecar from.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -45,6 +49,8 @@ const NATIVE_PORT = 4445;
 const NATIVE_DRIVER = "/usr/bin/WebKitWebDriver";
 const DRIVER_START_TIMEOUT_MS = 15_000;
 const STOP_GRACE_MS = 5_000;
+/** How long the app's helper processes may take to exit after it quits (WebKit's took about 7 s). */
+const LEFTOVER_GRACE_MS = 15_000;
 const RESULTS_DIR = path.join(ROOT, "test-results");
 
 let driver: ChildProcess | null = null;
@@ -123,6 +129,17 @@ function startedByRun(dir: string): Array<{ pid: number; command: string }> {
 	return found;
 }
 
+/** The run's processes still alive once `LEFTOVER_GRACE_MS` has passed (or none earlier, as soon as all exit). */
+async function outlivingRun(dir: string): Promise<Array<{ pid: number; command: string }>> {
+	const deadline = Date.now() + LEFTOVER_GRACE_MS;
+	let found = startedByRun(dir);
+	while (found.length > 0 && Date.now() < deadline) {
+		await sleep(100);
+		found = startedByRun(dir);
+	}
+	return found;
+}
+
 /** Processes whose command line carries this run's profile root: only apps we launched. */
 function appProcesses(dir: string): number[] {
 	const literal = dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -146,6 +163,8 @@ async function waitForDriver(child: ChildProcess, port: number): Promise<void> {
 
 /** Only `wdio.packaged.conf.ts` runs this spec, against an installed build. */
 export const PACKAGED_SPEC = "./e2e-tauri/packaged-smoke.e2e.ts";
+/** The specs that run the compiled `resources/omp`; `OMP_E2E_NO_SIDECAR=1` leaves them out. */
+export const SIDECAR_SPECS = ["./e2e-tauri/real-core.e2e.ts", "./e2e-tauri/deep-audit.e2e.ts"];
 
 /**
  * Check the app and drivers exist and the ports are free, create the run
@@ -199,7 +218,7 @@ export const config: WebdriverIO.Config = {
 	runner: "local",
 	tsConfigPath: "./tsconfig.wdio.json",
 	specs: ["./e2e-tauri/*.e2e.ts"],
-	exclude: [PACKAGED_SPEC],
+	exclude: [PACKAGED_SPEC, ...(process.env.OMP_E2E_NO_SIDECAR === "1" ? SIDECAR_SPECS : [])],
 	maxInstances: 1,
 	hostname: "127.0.0.1",
 	port: DRIVER_PORT,
@@ -248,7 +267,9 @@ export const config: WebdriverIO.Config = {
 		// Anything still carrying this run's directory in its environment was
 		// started by a launch and outlived it (a sidecar, a stats server, a tool):
 		// stop it, then fail the run, because the app should never leave it behind.
-		const leftovers = dir ? startedByRun(dir) : [];
+		// WebKit's network and web processes notice their app is gone only seconds
+		// later, so the run's processes get a grace period to exit on their own first.
+		const leftovers = dir ? await outlivingRun(dir) : [];
 		for (const leftover of leftovers) await stop(leftover.pid, "leftover");
 		if (dir) {
 			await fsp.rm(dir, { recursive: true, force: true });

@@ -13,11 +13,14 @@
  * never touched.
  */
 import { spawn } from "node:child_process";
+import * as dns from "node:dns/promises";
 import { once } from "node:events";
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import * as path from "node:path";
 import { $, browser, expect } from "@wdio/globals";
 import { writeDesktopPrefs } from "../e2e/desktop-prefs";
+import type { UpdateStatus } from "../src/shared/ipc-types";
 import type { RpcSessionState } from "../src/shared/rpc-types";
 import {
 	APP_ID,
@@ -36,6 +39,13 @@ import {
 import { fill, type LaunchOptions, launch, type PreparedLaunch, relaunch, until } from "./session";
 
 const executablePath = process.env.OMP_GUI_TEST_APP;
+/** The e2e-hooks build's test channels; a release build must not know any of them. */
+const TEST_CHANNELS = ["test:emit", "test:fault"];
+/** Where the compiled-in update feed lives (`src-tauri/src/updater/feed.rs`). */
+const RELEASE_HOST = "github.com";
+/** Errors that mean this machine has no route out, not that the release feed is wrong. */
+const OFFLINE_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "ECONNREFUSED"]);
+const OFFLINE_PROBE_TIMEOUT_MS = 10_000;
 /** The quick-entry bar's content size; nothing else the app shows has it. */
 const BAR = { width: 680, height: 168 };
 const QUIT_GRACE_MS = 15_000;
@@ -57,6 +67,44 @@ function labelled(label: string, assertion: () => void): void {
 function app(): string {
 	if (!executablePath) throw new Error("OMP_GUI_TEST_APP is not set");
 	return executablePath;
+}
+
+/** What `window.__TAURI_INTERNALS__` offers the page; Tauri injects it before any page script. */
+interface TauriInternals {
+	invoke<Result>(command: string, args: Record<string, unknown>): Promise<Result>;
+	transformCallback(callback: (message: unknown) => void, once?: boolean): number;
+}
+
+/** The feed request never got an HTTP answer (as opposed to a 404, a parse error or a timeout). */
+function isTransportFailure(status: UpdateStatus): boolean {
+	return status.state === "error" && status.message.startsWith("latest-linux.yml could not be fetched: ");
+}
+
+/**
+ * Why this machine cannot reach the release host, or null when it can: a DNS
+ * lookup and a TCP connect to port 443. Only a missing route or name counts;
+ * a probe that times out is not an excuse, so the check then fails.
+ */
+async function offlineReason(): Promise<string | null> {
+	try {
+		const { address } = await dns.lookup(RELEASE_HOST);
+		await new Promise<void>((resolve, reject) => {
+			const socket = net.connect({ host: address, port: 443, timeout: OFFLINE_PROBE_TIMEOUT_MS });
+			socket.once("connect", () => {
+				socket.destroy();
+				resolve();
+			});
+			socket.once("timeout", () => {
+				socket.destroy();
+				reject(Object.assign(new Error(`connect to ${address}:443 timed out`), { code: "ETIMEDOUT" }));
+			});
+			socket.once("error", reject);
+		});
+		return null;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code && OFFLINE_CODES.has(code) ? `${RELEASE_HOST}: ${code}` : null;
+	}
 }
 
 let current: Profile | null = null;
@@ -348,12 +396,68 @@ describe("installed package", () => {
 		expect(platform).toBe("linux");
 	}).timeout(120_000);
 
-	it("checks for updates against latest-linux.yml", async () => {
+	it("checks for updates against the published release feed", async function () {
 		await start("updates", { noProject: true });
 		const status = await browser.execute(() => window.omp.updater.check());
-		// A release without Linux metadata fails naming the channel file; one
-		// with it resolves to a version verdict. Both prove the channel.
-		expect(JSON.stringify(status)).toMatch(/latest-linux\.yml|"state":"(not-available|available)"/);
+		// Only a version verdict proves the compiled-in feed URL: a 404 (wrong
+		// repository), an unparsable feed or a timeout fails here. A missing feed
+		// is covered by the updater's own tests against a local server.
+		if (status.state !== "available" && status.state !== "not-available") {
+			const offline = isTransportFailure(status) ? await offlineReason() : null;
+			if (offline) {
+				console.warn(
+					`SKIPPED the update check: this machine has no route to the release host (${offline}); the app reported ${JSON.stringify(status)}`,
+				);
+				this.skip();
+			}
+		}
+		expect(JSON.stringify(status)).toMatch(/"state":"(not-available|available)"/);
+	}).timeout(120_000);
+
+	it("refuses the test-only bridge channels", async () => {
+		await start("test-channels", { noProject: true });
+		const replies = await browser.execute(async (channels: string[]) => {
+			const internals = (window as unknown as { __TAURI_INTERNALS__: TauriInternals }).__TAURI_INTERNALS__;
+			// A page generation of its own, attached so its calls are dispatched in order at once.
+			// It supersedes the page's generation, so this is the launch's last bridge use.
+			const gen = `smoke-${crypto.randomUUID()}`;
+			const sink = internals.transformCallback(() => {});
+			await internals.invoke("omp_attach", { gen, onMessage: `__CHANNEL__:${sink}` });
+			const out: string[] = [];
+			for (const [seq, channel] of channels.entries()) {
+				try {
+					await internals.invoke("omp_invoke", { channel, args: [null], seq, gen });
+					out.push(`${channel}: answered`);
+				} catch (error) {
+					const message = (error as { message?: unknown } | null)?.message;
+					out.push(typeof message === "string" ? message : String(error));
+				}
+			}
+			return out;
+		}, TEST_CHANNELS);
+		expect(replies).toEqual(TEST_CHANNELS.map(channel => `unknown channel: ${channel}`));
+	}).timeout(120_000);
+
+	it("refuses camera access", async function () {
+		await start("camera", { noProject: true });
+		const outcome = await browser.execute(async () => {
+			// WebKit asks the shell only when a camera exists; without one it answers
+			// OverconstrainedError itself, which says nothing about the shell's policy.
+			const devices = await navigator.mediaDevices.enumerateDevices();
+			if (!devices.some(device => device.kind === "videoinput")) return null;
+			try {
+				const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+				for (const track of stream.getTracks()) track.stop();
+				return "granted";
+			} catch (error) {
+				return error instanceof DOMException ? error.name : String(error);
+			}
+		});
+		if (outcome === null) {
+			console.warn("SKIPPED the camera check: this session has no camera, so WebKit never asks the shell");
+			this.skip();
+		}
+		expect(outcome).toBe("NotAllowedError");
 	}).timeout(120_000);
 
 	it("a hard kill leaves no sidecar or supervisor", async () => {

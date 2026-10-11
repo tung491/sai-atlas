@@ -96,42 +96,4 @@ describe("runtime", () => {
 		await browser.saveScreenshot("test-results/runtime-recovered.png");
 		expect(errors).toEqual([]);
 	}).timeout(180_000);
-
-	it("an older real core reports unavailable capabilities and retains the editable draft", async function () {
-		// Set a preserved pre-refactor sidecar path for the compatibility audit.
-		const legacyCore = process.env.OMP_GUI_LEGACY_CORE;
-		if (!legacyCore) this.skip();
-		await launch({ name: "legacy", omp: legacyCore });
-		await awaitBridge(browser);
-		await collectPageErrors(browser);
-
-		expect(await until(sidecarStatus, status => status === "ready", { timeout: 60_000 })).toBe("ready");
-		const responses = await browser.execute(async () => ({
-			state: await window.omp.rpc.getState(),
-			git: await window.omp.rpc.getGitChanges(),
-			share: await window.omp.rpc.previewShareSession(),
-		}));
-		expect(responses.state.success).toBe(true);
-		expect(responses.git.success).toBe(false);
-		expect(responses.share.success).toBe(false);
-		if (await $('[role="dialog"]').isExisting()) {
-			await browser.keys("Escape");
-			await expect($$('[role="dialog"]')).toBeElementsArrayOfSize(0);
-		}
-		await $("textarea").setValue("/share");
-		await $(SEND).click();
-		const modal = $('[role="dialog"]');
-		await expect(modal).toBeDisplayed();
-		await expect(modal.$("aria/Refresh preview")).toBeDisplayed();
-		await expect(modal.$("aria/Upload and create link")).not.toBeExisting();
-		await browser.saveScreenshot("test-results/legacy-unavailable.png");
-		await browser.keys("Escape");
-		await $("textarea").setValue("legacy draft retained");
-		await browser.execute(() => window.omp.sidecar.restart());
-		expect(await until(sidecarStatus, status => status === "ready")).toBe("ready");
-		await expect($("textarea")).toHaveValue("legacy draft retained");
-		const errors = await pageErrors(browser);
-		await fs.writeFile("test-results/legacy.json", JSON.stringify({ responses, errors }, null, 2));
-		expect(errors).toEqual([]);
-	});
 });

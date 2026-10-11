@@ -5,7 +5,7 @@
  * LibreOffice timeout check (the clean-up of a large .xls whose soffice.bin is
  * SIGSTOPped as soon as it appears, so the conversion hits its timeout).
  *
- * Helpers follow the egress audit's spec (tools/egress-audit/egress.e2e.ts):
+ * Helpers follow the egress audit's spec (../egress-audit/egress.e2e.ts):
  * the desktop file chooser is replaced by one that returns the seeded input,
  * approvals are approved and questions get their recommended answer.
  */
@@ -14,9 +14,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $, browser } from "@wdio/globals";
-import { alive, pgrepFull, procInfo } from "./repo/e2e-tauri/outside";
-import { fill, until } from "./repo/e2e-tauri/session";
-import type { RpcSessionState } from "./repo/src/shared/rpc-types";
+import type { RpcSessionState } from "../../../src/shared/rpc-types";
+import { alive, pgrepFull, procInfo } from "../../outside";
+import { fill, until } from "../../session";
 
 const OUT = process.env.OFFLINE_OUT ?? "";
 const ACTION_TIMEOUT_MS = Number(process.env.OFFLINE_ACTION_TIMEOUT_MS || 20 * 60_000);
@@ -111,7 +111,10 @@ function answerDialog(): Promise<string | null> {
 		}
 		const input = dialog.querySelector("input") as HTMLInputElement | null;
 		if (form && input) {
-			Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "Use your best judgement.");
+			Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(
+				input,
+				"Use your best judgement.",
+			);
 			input.dispatchEvent(new Event("input", { bubbles: true }));
 			(form.querySelector('button[type="submit"]') as HTMLButtonElement | null)?.click();
 			return `answered input: ${summary}`;
@@ -245,7 +248,9 @@ describe("offline check", () => {
 				await runSetup.click();
 				await $(WELCOME).waitForDisplayed({ timeout: 30_000 });
 			}
-			const getStarted = $(`//*[@aria-label="Set up your local assistant"]//button[normalize-space(.)="Get started"]`);
+			const getStarted = $(
+				`//*[@aria-label="Set up your local assistant"]//button[normalize-space(.)="Get started"]`,
+			);
 			await browser.waitUntil(async () => (await getStarted.isExisting()) && (await getStarted.isEnabled()), {
 				timeout: 120_000,
 				timeoutMsg: "Get started never became enabled",
@@ -284,7 +289,9 @@ describe("offline check", () => {
 			await typeAndSend("run ls");
 			const result = await settle();
 			const tools = await browser.execute(() =>
-				Array.from(document.querySelectorAll("[data-transcript-kind]")).map(row => row.getAttribute("data-transcript-kind")),
+				Array.from(document.querySelectorAll("[data-transcript-kind]")).map(row =>
+					row.getAttribute("data-transcript-kind"),
+				),
 			);
 			return { outcome: result.outcome, notes: `${result.notes} ; transcript kinds: ${tools.join(",")}` };
 		});
@@ -302,7 +309,10 @@ describe("offline check", () => {
 					if (pid) {
 						process.kill(pid, "SIGSTOP");
 						stopped = { pid, at: now() };
-						fs.writeFileSync(path.join(OUT, "2b-stopped.txt"), `${sh("ps", ["-o", "pid,ppid,stat,args", "-p", String(pid)])}`);
+						fs.writeFileSync(
+							path.join(OUT, "2b-stopped.txt"),
+							`${sh("ps", ["-o", "pid,ppid,stat,args", "-p", String(pid)])}`,
+						);
 					}
 					await sleep(50);
 				}
@@ -327,7 +337,10 @@ describe("offline check", () => {
 			const s = stopped as { pid: number; at: number };
 			if (!reported) {
 				const snapshot = sh("ps", ["-eo", "pid,ppid,stat,etime,args"]);
-				fs.writeFileSync(path.join(OUT, "2b-pgrep.txt"), `tool never reported within ${CONVERT_REPORT_LIMIT_MS} ms of the stop\n${snapshot}`);
+				fs.writeFileSync(
+					path.join(OUT, "2b-pgrep.txt"),
+					`tool never reported within ${CONVERT_REPORT_LIMIT_MS} ms of the stop\n${snapshot}`,
+				);
 				for (const pid of soffices()) process.kill(pid, "SIGKILL");
 				return { outcome: "tool never reported a result", notes: `stopped pid ${s.pid}` };
 			}

@@ -7,10 +7,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { $, browser } from "@wdio/globals";
-import { en } from "./repo/src/renderer/locales/en";
-import { vi } from "./repo/src/renderer/locales/vi";
-import { fill, until } from "./repo/e2e-tauri/session";
-import type { RpcSessionState } from "./repo/src/shared/rpc-types";
+import { en } from "../../../src/renderer/locales/en";
+import { vi } from "../../../src/renderer/locales/vi";
+import type { RpcSessionState } from "../../../src/shared/rpc-types";
+import { fill, until } from "../../session";
 
 export type Lang = "en" | "vi";
 export const LANG: Lang = process.env.OFFLINE_LANG === "vi" ? "vi" : "en";
@@ -105,8 +105,8 @@ function dialogLabels(): DialogLabels {
 
 /** True when a dialog is showing. */
 export function dialogShown(): Promise<boolean> {
-	return browser.execute(
-		() => Array.from(document.querySelectorAll('[role="dialog"]')).some(d => d.getClientRects().length > 0),
+	return browser.execute(() =>
+		Array.from(document.querySelectorAll('[role="dialog"]')).some(d => d.getClientRects().length > 0),
 	);
 }
 

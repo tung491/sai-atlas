@@ -6,14 +6,12 @@
  * egress-app-launcher.sh, which runs the installed app under strace with its
  * default profile and the seeded ~/.omp, never a throwaway profile.
  *
- * The entrypoint copies this file into a work directory beside two links:
- * `node_modules` (the worktree's, for @wdio/*) and `repo` (the worktree, for
- * wdio.conf.ts and the e2e-tauri helpers).
+ * It runs in place from the repository the container mounts at /repo.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { browser } from "@wdio/globals";
-import { config as base, startRun } from "./repo/wdio.conf";
+import { config as base, startRun } from "../../../wdio.conf";
 
 const INSTALLED_APP = "/usr/bin/sai-atlas";
 
@@ -23,13 +21,12 @@ function required(name: string): string {
 	return value;
 }
 
-const work = required("EGRESS_WORK");
+const here = import.meta.dirname;
 const out = required("EGRESS_OUT");
 
 export const config: WebdriverIO.Config = {
 	...base,
-	tsConfigPath: path.join(work, "repo", "tsconfig.wdio.json"),
-	specs: [path.join(work, "egress.e2e.ts")],
+	specs: [path.join(here, "egress.e2e.ts")],
 	exclude: [],
 	// One action can run a local model for many minutes; each action enforces its own limit.
 	mochaOpts: { ui: "bdd", timeout: 60 * 60_000, bail: false },
@@ -38,7 +35,7 @@ export const config: WebdriverIO.Config = {
 		// The launch is the start of the first-run action; the spec reads this stamp.
 		fs.writeFileSync(path.join(out, "launch-start"), `${(Date.now() / 1000).toFixed(3)}\n`);
 		Object.assign(capabilities, {
-			"tauri:options": { application: path.join(work, "egress-app-launcher.sh"), args: [] },
+			"tauri:options": { application: path.join(here, "egress-app-launcher.sh"), args: [] },
 			"wdio:enforceWebDriverClassic": true,
 		});
 	},

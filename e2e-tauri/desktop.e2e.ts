@@ -13,6 +13,7 @@ import {
 	pageErrorLog,
 	recorded,
 	relaunch,
+	runtimeLogPath,
 	until,
 } from "./session";
 import {
@@ -50,6 +51,17 @@ async function command(text: string): Promise<void> {
 
 function rpc(type: string) {
 	return recorded(app.record, type);
+}
+
+/** The URLs the shell's navigation lock refused for this launch, from its runtime log. */
+async function blockedNavigations(): Promise<string[]> {
+	const text = await fs.readFile(runtimeLogPath(app), "utf8").catch(() => "");
+	return text
+		.split("\n")
+		.filter(Boolean)
+		.map(line => JSON.parse(line) as { message?: string; details?: { url?: string } })
+		.filter(entry => entry.message?.startsWith("blocked navigation of ") && entry.details?.url)
+		.map(entry => entry.details?.url ?? "");
 }
 
 /** Playwright's `locator.press(key)`: focus the element, then press. */
@@ -661,6 +673,52 @@ describe("desktop", () => {
 				can => can,
 			),
 		).toBe(true);
+	});
+
+	it("the navigation lock keeps the page on the app and logs every navigation it blocks", async () => {
+		const trustedUrl = await browser.getUrl();
+		// Another origin, and the app's own origin on a page the window does not show.
+		for (const target of ["https://example.com/navigation-lock", "tauri://localhost/other.html"]) {
+			await browser.execute((url: string) => {
+				window.location.href = url;
+			}, target);
+			expect(
+				await until(
+					() => blockedNavigations(),
+					urls => urls.includes(target),
+				),
+			).toContain(target);
+			expect(await browser.getUrl()).toBe(trustedUrl);
+		}
+		await expect($("textarea")).toBeEnabled();
+	});
+
+	it("window.open opens no app window, for a file: URL or an app page", async () => {
+		const trustedUrl = await browser.getUrl();
+		const handles = await browser.getWindowHandles();
+		const documentPath = path.join(app.dir, "popup.html");
+		await fs.writeFile(documentPath, "<!doctype html><title>Popup</title><h1>Popup</h1>");
+		// Both reach the shell's new-window lock, which denies every non-web scheme.
+		// The popup comes from a real click: WebKit drops a script's popup without one.
+		for (const target of [pathToFileURL(documentPath).href, "tauri://localhost/other.html"]) {
+			await browser.execute((url: string) => {
+				const button = document.createElement("button");
+				button.id = "omp-e2e-popup";
+				button.textContent = "Open popup";
+				button.addEventListener("click", () => {
+					(window as unknown as { __ompPopup?: boolean }).__ompPopup = window.open(url, "_blank") !== null;
+					button.remove();
+				});
+				document.body.append(button);
+			}, target);
+			await $("#omp-e2e-popup").click();
+			// A refused window is `null` inside `window.open` itself and never exists.
+			const opened = await browser.execute(() => (window as unknown as { __ompPopup?: boolean }).__ompPopup);
+			labelled(`window.open(${target})`, () => expect(opened).toBe(false));
+			expect(await browser.getWindowHandles()).toEqual(handles);
+			expect(await browser.getUrl()).toBe(trustedUrl);
+		}
+		await expect($("textarea")).toBeEnabled();
 	});
 
 	it("launch profile updates preserve concurrent fields and workspaces through the real preferences store", async () => {

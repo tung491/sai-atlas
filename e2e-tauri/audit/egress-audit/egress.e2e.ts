@@ -1,5 +1,5 @@
 /**
- * The recorded session of the egress audit: every action of Task 9.6 step 3,
+ * The recorded session of the egress audit: every audited action,
  * in order, against the installed app running under strace. Each action
  * appends one row to $EGRESS_OUT/timeline.tsv (epoch start and end, outcome,
  * what the app showed), which egress-report.ts joins with the connect() trace.
@@ -21,9 +21,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $, $$, browser } from "@wdio/globals";
-import { alive, pgrepFull, procInfo } from "./repo/e2e-tauri/outside";
-import { fill, until } from "./repo/e2e-tauri/session";
-import type { RpcSessionState } from "./repo/src/shared/rpc-types";
+import type { RpcSessionState } from "../../../src/shared/rpc-types";
+import { alive, pgrepFull, procInfo } from "../../outside";
+import { fill, until } from "../../session";
 
 const OUT = process.env.EGRESS_OUT ?? "";
 const DRY_RUN = process.env.EGRESS_DRY_RUN === "1";

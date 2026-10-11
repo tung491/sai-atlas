@@ -11,9 +11,9 @@
 # session bus): starts a headless weston, runs offline.conf.ts, then copies the
 # evidence to /out.
 #
-# Mounts: /repo (GUI worktree: node_modules, e2e-tauri helpers), /tools (this
-# directory, read-only), /out (evidence), /relay (the Ollama socket),
-# /tmp/sai-atlas.deb. Env: HOST_UID, HOST_GID, OFFLINE_ACTION_TIMEOUT_MS,
+# Mounts: /repo (the GUI checkout this script lives in: its node_modules, the
+# e2e-tauri helpers and this harness), /out (evidence), /relay (the Ollama
+# socket), /tmp/sai-atlas.deb. Env: HOST_UID, HOST_GID, OFFLINE_ACTION_TIMEOUT_MS,
 # OFFLINE_LANG (vi = the Vietnamese pass: the GUI settings file is seeded with
 # `language: vi`, the inputs are Vietnamese and the large .xls is not made).
 set -euo pipefail
@@ -30,18 +30,14 @@ if [[ ${1:-} == --session ]]; then
 	done
 	[[ -S $XDG_RUNTIME_DIR/wayland-1 ]] || { cat "$XDG_RUNTIME_DIR/weston.log" >&2; exit 1; }
 
-	work=$(mktemp -d /tmp/offline-work-XXXXXX)
-	cp /tools/offline.conf.ts /tools/offline.e2e.ts /tools/offline-vi.e2e.ts /tools/offline-helpers.ts /tools/offline-app-launcher.sh "$work/"
-	ln -s /repo/node_modules "$work/node_modules"
-	ln -s /repo "$work/repo"
 	mkdir -p /out/screens
-	export OFFLINE_WORK=$work OFFLINE_OUT=/out
+	export OFFLINE_OUT=/out
 
 	status=0
 	(
 		cd /repo
 		WAYLAND_DISPLAY=wayland-1 XDG_SESSION_TYPE=wayland \
-			node node_modules/@wdio/cli/bin/wdio.js run "$work/offline.conf.ts"
+			node node_modules/@wdio/cli/bin/wdio.js run e2e-tauri/audit/offline-check/offline.conf.ts
 	) || status=$?
 
 	state=/out/container-state
@@ -59,7 +55,6 @@ if [[ ${1:-} == --session ]]; then
 	} >/out/bash-grep.txt
 	cp -r "$HOME/.omp/agent/sessions" "$state/sessions" 2>/dev/null || true
 	cp -r "$HOME/.config/@oh-my-pi/omp-gui/logs" "$state/gui-logs" 2>/dev/null || true
-	rm -rf "$work"
 	exit "$status"
 fi
 

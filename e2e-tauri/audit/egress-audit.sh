@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Egress audit harness (everyday-work rebrand, Phase 9 Task 9.6).
+# Egress audit harness: every network destination the installed app and its
+# children reach during a realistic session.
 #
 # Installs the Sai ATLAS .deb in a clean Ubuntu 24.04 container (the deb smoke
 # image plus strace), seeds a realistic power-user home (~/.omp/agent with
 # config.yml, mcp.json and a user extension; ~/.env with made-up provider
 # keys), points the app at the host's Ollama on loopback (host networking:
 # the container's 127.0.0.1:11434 is the host's), runs the app under
-# `strace -f -e trace=connect,sendto,sendmsg`, and drives every Task 9.6 step 3 action in
+# `strace -f -e trace=connect,sendto,sendmsg`, and drives every audited action in
 # order through WebDriver, stamping each action in timeline.tsv. Then it turns
 # the trace into rows of (process, destination host:port, action).
 #
@@ -14,10 +15,11 @@
 #   bash egress-audit.sh                      # the recorded session (needs the host Ollama trace running)
 #   bash egress-audit.sh --report-only        # re-run the post-processing (after the Ollama trace stopped)
 #
-# Options: --deb PATH (default: the newest .deb of the worktree's Linux target),
-# --out DIR (default: plans/reports/egress-261006; a dry run defaults to a
+# Options: --deb PATH (default: the newest .deb of this checkout's Linux target),
+# --out DIR (default: test-results/egress-audit; a dry run defaults to a
 # fresh temp dir), --no-ollama-trace (record without the host Ollama trace).
-# Env: EGRESS_WORKTREE (default /home/tung491/WORK/worktrees/rebrand-integration),
+# The container mounts this checkout at /repo and runs the harness from
+# e2e-tauri/audit/egress-audit/ in place. Env:
 # EGRESS_ACTION_TIMEOUT_MS (per action, default 20 min), EGRESS_MODEL (an
 # installed Ollama tag to run the jobs on instead of the one Get started picks,
 # e.g. hf.co/google/gemma-4-E4B-it-qat-q4_0-gguf:latest).
@@ -34,8 +36,8 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 tools=$here/egress-audit
-worktree=${EGRESS_WORKTREE:-/home/tung491/WORK/worktrees/rebrand-integration}
-default_out=/home/tung491/WORK/oh-my-pi-gui/plans/reports/egress-261006
+worktree=$(cd "$here/../.." && pwd)
+default_out=$worktree/test-results/egress-audit
 smoke_image=sai-atlas-tauri-deb-smoke
 image=sai-atlas-egress-audit
 container=sai-atlas-egress-audit
@@ -53,7 +55,7 @@ while [[ $# -gt 0 ]]; do
 	--no-ollama-trace) need_ollama_trace=0 ;;
 	--deb) deb=${2:?--deb needs a path}; shift ;;
 	--out) out=${2:?--out needs a dir}; shift ;;
-	-h | --help) sed -n '2,32p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,34p' "$0"; exit 0 ;;
 	*) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
 	esac
 	shift
@@ -152,7 +154,6 @@ docker run --rm --init --name "$container" \
 	-e EGRESS_DRY_RUN="$dry_run" -e EGRESS_ACTION_TIMEOUT_MS -e EGRESS_MODEL \
 	-v "$worktree:/repo" \
 	-v "$deb:/tmp/sai-atlas.deb:ro" \
-	-v "$tools:/tools:ro" \
 	-v "$out:/out" \
 	"$image" || status=$?
 

@@ -2,13 +2,14 @@
 # Container entrypoint of the egress audit (egress-audit.sh starts it).
 #
 # Root stage: installs the mounted .deb the way `sudo apt install` does, seeds
-# the realistic power-user home (Task 9.6 step 2) and hands over to the host
+# the realistic power-user home and hands over to the host
 # user's uid. Session stage (--session, inside a private session bus): starts a
 # headless weston, runs the WebDriver run (egress.conf.ts) whose launcher wraps
 # the app in strace, then copies the container-side evidence to /out.
 #
-# Mounts: /repo (GUI worktree: node_modules, e2e-tauri helpers), /tools (this
-# directory, read-only), /out (the evidence directory), /tmp/sai-atlas.deb.
+# Mounts: /repo (the GUI checkout this script lives in: its node_modules, the
+# e2e-tauri helpers and this harness), /out (the evidence directory),
+# /tmp/sai-atlas.deb.
 # Env: HOST_UID, HOST_GID, EGRESS_DRY_RUN (1 = stop at the first-run screen),
 # EGRESS_ACTION_TIMEOUT_MS, EGRESS_MODEL.
 set -euo pipefail
@@ -29,20 +30,14 @@ if [[ ${1:-} == --session ]]; then
 		exit 1
 	fi
 
-	# The spec and config import @wdio/* and the worktree's e2e helpers; Node's
-	# ESM resolver finds them through two links beside the copied files.
-	work=$(mktemp -d /tmp/egress-work-XXXXXX)
-	cp /tools/egress.conf.ts /tools/egress.e2e.ts /tools/egress-app-launcher.sh "$work/"
-	ln -s /repo/node_modules "$work/node_modules"
-	ln -s /repo "$work/repo"
 	mkdir -p /out/screens /out/ps
-	export EGRESS_WORK=$work EGRESS_OUT=/out
+	export EGRESS_OUT=/out
 
 	status=0
 	(
 		cd /repo
 		WAYLAND_DISPLAY=wayland-1 XDG_SESSION_TYPE=wayland \
-			node node_modules/@wdio/cli/bin/wdio.js run "$work/egress.conf.ts"
+			node node_modules/@wdio/cli/bin/wdio.js run e2e-tauri/audit/egress-audit/egress.conf.ts
 	) || status=$?
 
 	# Evidence that lives only in the container's home: what the jobs saved,
@@ -61,7 +56,6 @@ if [[ ${1:-} == --session ]]; then
 	cp -r "$HOME/.omp/agent/sessions" "$state/sessions" 2>/dev/null || true
 	cp -r "$HOME/.config/@oh-my-pi/omp-gui/logs" "$state/gui-logs" 2>/dev/null || true
 	cp "$XDG_RUNTIME_DIR/weston.log" "$state/weston.log" 2>/dev/null || true
-	rm -rf "$work"
 	exit "$status"
 fi
 
