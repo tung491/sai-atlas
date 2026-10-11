@@ -834,11 +834,14 @@ mod tests {
     #[tokio::test]
     async fn prefs_set_refuses_a_main_owned_key_and_rebuilds_the_menu_on_language_change() {
         let fakes = Fakes::default();
-        fakes.desktop.main_owned_keys.lock().unwrap().push("windowBounds".into());
         let ctx = ctx(&fakes);
         let caller = Caller::main(WindowId(1));
-        let refused = bridge::dispatch_for_test(&ctx, caller, "prefs:set", vec![json!({ "key": "windowBounds", "value": {} })]).await;
-        assert!(refused.is_err());
+        for key in ["ollamaContextFit", "ollamaContextFit.models", "quickEntryShortcut.chord"] {
+            let refused = bridge::dispatch_for_test(&ctx, caller, "prefs:set", vec![json!({ "key": key, "value": { "x": 1 } })]).await;
+            assert_eq!(refused, Err(bridge::IpcError::new("Preference is managed by the app")), "{key}");
+        }
+        assert_eq!(ctx.prefs.get("ollamaContextFit"), None);
+        assert_eq!(ctx.prefs.get("quickEntryShortcut"), None);
 
         bridge::dispatch_for_test(&ctx, caller, "prefs:set", vec![json!({ "key": "language", "value": "vi" })]).await.unwrap();
         assert!(fakes.desktop.log.calls().iter().any(|call| call == "rebuild_menu()"));
@@ -1223,6 +1226,165 @@ mod tests {
         let ctx = ctx(&fakes);
         let reply = super::fs_read_document(&ctx, Caller::main(WindowId(1)), vec![json!({ "path": "/nonexistent/a.docx" })]);
         assert!(matches!(reply, crate::bridge::Reply::Later(_)));
+    }
+
+    const PNG_HEADER: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52];
+
+    /// Window 1's workspace is `<tmp>/ws`; its parent holds files outside it.
+    fn workspace_fakes() -> (Fakes, tempfile::TempDir, std::path::PathBuf) {
+        let outer = tempfile::tempdir().unwrap();
+        let ws = outer.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        let fakes = Fakes::default();
+        fakes.tabs.cwds.lock().unwrap().insert(WindowId(1), ws.to_string_lossy().into_owned());
+        (fakes, outer, ws)
+    }
+
+    async fn dispatch(ctx: &std::sync::Arc<crate::ctx::AppCtx>, channel: &str, payload: serde_json::Value) -> serde_json::Value {
+        bridge::dispatch_for_test(ctx, Caller::main(WindowId(1)), channel, vec![payload]).await.unwrap()
+    }
+
+    fn image_failure(error: &str) -> serde_json::Value {
+        json!({ "ok": false, "dataUrl": null, "mime": null, "size": 0, "error": error })
+    }
+
+    #[tokio::test]
+    async fn fs_read_image_refuses_an_image_above_the_cap() {
+        let (fakes, _outer, ws) = workspace_fakes();
+        std::fs::write(ws.join("small.png"), PNG_HEADER).unwrap();
+        // Sparse: a real PNG header, then a hole up to one byte past the cap.
+        let big = std::fs::File::create(ws.join("big.png")).unwrap();
+        std::io::Write::write_all(&mut &big, PNG_HEADER).unwrap();
+        big.set_len(super::workspace_fs::FS_IMAGE_MAX_BYTES + 1).unwrap();
+        let ctx = ctx(&fakes);
+        let small = dispatch(&ctx, "fs:read-image", json!({ "path": "small.png" })).await;
+        assert_eq!((small["ok"].clone(), small["mime"].clone()), (json!(true), json!("image/png")));
+        assert_eq!(dispatch(&ctx, "fs:read-image", json!({ "path": "big.png" })).await, image_failure("Image too large"));
+    }
+
+    #[tokio::test]
+    async fn fs_read_image_refuses_a_text_or_key_file_that_is_not_an_image() {
+        let (fakes, outer, ws) = workspace_fakes();
+        std::fs::write(ws.join("notes.png"), "just text named like an image\n").unwrap();
+        let key = outer.path().join("id_ed25519.pem");
+        std::fs::write(&key, "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n").unwrap();
+        let ctx = ctx(&fakes);
+        assert_eq!(dispatch(&ctx, "fs:read-image", json!({ "path": "notes.png" })).await, image_failure("Not a supported image"));
+        assert_eq!(
+            dispatch(&ctx, "fs:read-image", json!({ "path": key.to_string_lossy() })).await,
+            image_failure("Not a supported image")
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_read_image_refuses_a_relative_path_that_escapes_the_workspace() {
+        let (fakes, outer, _ws) = workspace_fakes();
+        std::fs::write(outer.path().join("secret.png"), PNG_HEADER).unwrap();
+        let ctx = ctx(&fakes);
+        assert_eq!(
+            dispatch(&ctx, "fs:read-image", json!({ "path": "../secret.png" })).await,
+            image_failure("Path escapes the workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_read_and_fs_list_refuse_a_relative_path_that_escapes_the_workspace() {
+        let (fakes, outer, ws) = workspace_fakes();
+        std::fs::write(outer.path().join("secret.txt"), "top secret").unwrap();
+        std::fs::write(ws.join("inside.txt"), "fine").unwrap();
+        let ctx = ctx(&fakes);
+        assert_eq!(dispatch(&ctx, "fs:read", json!({ "path": "inside.txt" })).await["content"], json!("fine"));
+        assert_eq!(
+            dispatch(&ctx, "fs:read", json!({ "path": "../secret.txt" })).await,
+            json!({ "ok": false, "content": "", "truncated": false, "binary": false, "size": 0, "error": "Path escapes the workspace" })
+        );
+        for path in ["../", "..", "sub/../../"] {
+            assert_eq!(
+                dispatch(&ctx, "fs:list", json!({ "path": path })).await,
+                json!({ "ok": false, "entries": [], "truncated": false, "error": "Path escapes the workspace" }),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_read_plan_refuses_a_path_outside_the_workspace_and_the_sessions_dir() {
+        let (fakes, outer, _ws) = workspace_fakes();
+        let sessions = outer.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::write(sessions.join("a-plan.md"), "# allowed").unwrap();
+        let elsewhere = outer.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("plan.md"), "# secret").unwrap();
+        *fakes.services.sessions_dir.lock().unwrap() = sessions.clone();
+        let ctx = testing::fake_ctx_with(&fakes, registry());
+        let allowed = dispatch(&ctx, "fs:read-plan", json!({ "fsPath": sessions.join("a-plan.md").to_string_lossy() })).await;
+        assert_eq!(allowed["content"], json!("# allowed"));
+        let refused = json!({ "ok": false, "path": null, "content": null, "error": "Path escapes allowed roots" });
+        let outside = elsewhere.join("plan.md").to_string_lossy().into_owned();
+        for payload in [
+            json!({ "fsPath": outside }),
+            json!({ "fsPath": "../elsewhere/plan.md" }),
+            json!({ "fsPath": "missing-plan.md", "localRoot": elsewhere.to_string_lossy() }),
+        ] {
+            assert_eq!(dispatch(&ctx, "fs:read-plan", payload.clone()).await, refused, "{payload}");
+        }
+    }
+
+    /// The renderer's wire shapes, read by `create-omp-api.test.ts` too, so the
+    /// payload the API sends is the one these handlers are tested against.
+    const RENDERER_PAYLOADS: &str = include_str!("../../../src/shared/bridge/ipc-payload-fixtures.json");
+
+    /// Dispatch the named renderer payload as window 1.
+    async fn dispatch_renderer_payload(ctx: &std::sync::Arc<crate::ctx::AppCtx>, name: &str) -> serde_json::Value {
+        let payloads: serde_json::Value = serde_json::from_str(RENDERER_PAYLOADS).unwrap();
+        let fixture = &payloads[name];
+        let channel = fixture["channel"].as_str().unwrap_or_else(|| panic!("no fixture named {name}"));
+        let args = fixture["args"].as_array().unwrap().clone();
+        bridge::dispatch_for_test(ctx, Caller::main(WindowId(1)), channel, args).await.unwrap()
+    }
+
+    fn workspaces_asked_for(fakes: &Fakes) -> Vec<String> {
+        fakes.tabs.log.calls().into_iter().filter(|call| call.starts_with("cwd_for(")).collect()
+    }
+
+    #[tokio::test]
+    async fn reads_the_tab_of_a_renderer_open_path_payload() {
+        let (fakes, _outer, ws) = workspace_fakes();
+        std::fs::write(ws.join("a.pdf"), "%PDF-").unwrap();
+        std::fs::write(ws.join("b.md"), "# b").unwrap();
+        let ctx = ctx(&fakes);
+        let in_tab = dispatch_renderer_payload(&ctx, "openPathInTab").await;
+        assert_eq!(in_tab, json!({ "ok": true, "resolvedPath": ws.join("a.pdf").to_string_lossy() }));
+        let without_tab = dispatch_renderer_payload(&ctx, "openPathWithoutTab").await;
+        assert_eq!(without_tab, json!({ "ok": true, "resolvedPath": ws.join("b.md").to_string_lossy() }));
+        assert_eq!(workspaces_asked_for(&fakes), [r#"cwd_for(1, Some("t2"))"#, "cwd_for(1, None)"]);
+    }
+
+    #[tokio::test]
+    async fn reads_the_tab_and_change_stamp_of_a_renderer_read_document_payload() {
+        let (fakes, _outer, ws) = workspace_fakes();
+        std::fs::create_dir(ws.join("docs")).unwrap();
+        let file = std::fs::File::create(ws.join("docs").join("a.docx")).unwrap();
+        std::io::Write::write_all(&mut &file, b"PK\x03").unwrap();
+        // The fixture's stamp: 3 bytes, modified 7 ms after the epoch.
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(7)).unwrap();
+        let ctx = ctx(&fakes);
+        let result = dispatch_renderer_payload(&ctx, "readDocumentInTabIfChanged").await;
+        let resolved = ws.join("docs").join("a.docx");
+        assert_eq!(result, json!({ "ok": true, "unchanged": true, "size": 3, "mtimeMs": 7, "resolvedPath": resolved.to_string_lossy() }));
+        assert_eq!(workspaces_asked_for(&fakes), [r#"cwd_for(1, Some("t1"))"#]);
+    }
+
+    #[tokio::test]
+    async fn reads_the_tab_of_a_renderer_read_image_payload() {
+        let (fakes, _outer, ws) = workspace_fakes();
+        std::fs::create_dir(ws.join("img")).unwrap();
+        std::fs::write(ws.join("img").join("a.png"), PNG_HEADER).unwrap();
+        let ctx = ctx(&fakes);
+        let result = dispatch_renderer_payload(&ctx, "readImageInTab").await;
+        assert_eq!((result["ok"].clone(), result["mime"].clone()), (json!(true), json!("image/png")));
+        assert_eq!(workspaces_asked_for(&fakes), [r#"cwd_for(1, Some("t2"))"#]);
     }
 
     #[tokio::test]

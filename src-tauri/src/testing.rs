@@ -122,12 +122,8 @@ impl Host for FakeHost {
 
     fn open_url(&self, url: &str) -> Result<(), HostError> {
         self.log.record(format!("open_url({url})"));
-        // The same guard as the real host's `open_url`.
-        if crate::services::system::sanitize_external_url(url).is_some() {
-            Ok(())
-        } else {
-            Err(HostError::Failed(format!("refused scheme in {url}")))
-        }
+        // The real host's guard, not a copy of it.
+        crate::services::system::host_open_url_target(url).map(|_| ())
     }
 
     fn open_path(&self, path: &std::path::Path) -> Result<(), HostError> {
@@ -181,7 +177,8 @@ impl Host for FakeHost {
 
 /// A sidecar that records what the pool asks of it and answers requests from a script.
 pub struct FakeSidecar {
-    pub log: CallLog,
+    /// Shared with the future `dispose` returns, which records when it is awaited.
+    pub log: Arc<CallLog>,
     pub options: SidecarOptions,
     pub status: Mutex<SidecarStatus>,
     /// The whole last status, when a test sets one; otherwise built from `status` and `cwd`.
@@ -199,7 +196,7 @@ impl FakeSidecar {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let cwd = options.cwd.clone();
         let sidecar = Arc::new(Self {
-            log: CallLog::default(),
+            log: Arc::default(),
             options,
             status: Mutex::new(SidecarStatus::Asleep),
             status_payload: Mutex::new(None),
@@ -299,11 +296,14 @@ impl SidecarHandle for FakeSidecar {
         ready(())
     }
 
+    /// The real manager signals the process on the call and escalates in the
+    /// returned future, so the future records whether anyone ran it.
     fn dispose(&self) -> BoxFuture<'static, ()> {
         self.log.record("dispose()");
         *lock(&self.status) = SidecarStatus::Exited;
         lock(&self.events).take();
-        ready(())
+        let log = self.log.clone();
+        Box::pin(async move { log.record("dispose awaited") })
     }
 }
 
@@ -322,12 +322,18 @@ impl EventBatcher for ImmediateBatcher {
     fn dispose(&self) {}
 }
 
+/// Runs inside `FakeOmp::new_sidecar`, before the fake exists.
+pub type NewSidecarHook = Box<dyn FnOnce(&SidecarOptions) + Send>;
+
 #[derive(Default)]
 pub struct FakeOmp {
     pub log: CallLog,
     pub sidecars: Mutex<Vec<Arc<FakeSidecar>>>,
     pub env: Mutex<HashMap<String, String>>,
     pub editor_command: Mutex<Option<String>>,
+    /// Taken by the next `new_sidecar`, so a test can act (or panic) while
+    /// the caller is mid-spawn. It runs once: a nested spawn does not re-enter it.
+    pub on_new_sidecar: Mutex<Option<NewSidecarHook>>,
 }
 
 impl FakeOmp {
@@ -343,6 +349,10 @@ impl OmpPort for FakeOmp {
 
     fn new_sidecar(&self, options: SidecarOptions) -> (Arc<dyn SidecarHandle>, SidecarEvents) {
         self.log.record(format!("new_sidecar({}, {:?}, fresh={})", options.cwd, options.kind, options.fresh));
+        let hook = lock(&self.on_new_sidecar).take();
+        if let Some(hook) = hook {
+            hook(&options);
+        }
         let (sidecar, events) = FakeSidecar::new(options);
         lock(&self.sidecars).push(sidecar.clone());
         (sidecar, events)
@@ -533,7 +543,6 @@ pub struct FakeDesktop {
     pub quitting: Mutex<bool>,
     pub quit_risk: Mutex<QuitRisk>,
     pub approve_install: Mutex<bool>,
-    pub main_owned_keys: Mutex<Vec<String>>,
     pub closed_listeners: Mutex<Vec<WindowClosedListener>>,
     /// What `on_exit_requested` answers (true keeps the app running).
     pub prevent_exit: Mutex<bool>,
@@ -625,7 +634,8 @@ impl DesktopPort for FakeDesktop {
     }
 
     fn is_main_owned_pref_key(&self, key: &str) -> bool {
-        lock(&self.main_owned_keys).iter().any(|owned| owned == key)
+        // The real rule, so a dispatch test refuses exactly what the app refuses.
+        crate::desktop::shortcut_core::is_main_owned_pref_key(key)
     }
 
     fn on_second_instance(&self, argv: Vec<String>, cwd: Option<String>) {

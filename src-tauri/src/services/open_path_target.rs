@@ -160,4 +160,52 @@ mod tests {
         let decision = decide("/repo/deploy.sh", vec![("/repo/deploy.sh", with_real(text(), "/repo/.x/notes"))]);
         assert_eq!(decision.map(|d| d.action), Some(OpenAction::Reveal));
     }
+
+    /// One name per deny-list entry, each in mixed case; written out rather
+    /// than derived from the list, so dropping an entry turns this red.
+    const LAUNCHER_NAMES: [&str; 22] = [
+        "Tool.AppImage",
+        "setup.Bat",
+        "run.CMD",
+        "Build.Command",
+        "app.DeskTop",
+        "Setup.EXE",
+        "notes.FileLoc",
+        "site.InetLoc",
+        "App.Jar",
+        "launch.JNLP",
+        "bundle.MPkg",
+        "Install.PKG",
+        "script.Ps1",
+        "build.PY",
+        "deploy.Sh",
+        "open.Terminal",
+        "helper.TOOL",
+        "macro.VBE",
+        "macro.Vbs",
+        "link.WebLoc",
+        "job.WSF",
+        "host.Wsh",
+    ];
+
+    #[test]
+    fn treats_every_launcher_extension_as_a_program_whatever_its_case() {
+        assert_eq!(LAUNCHER_NAMES.len(), PROGRAM_EXTENSIONS.len(), "every deny-list entry needs a name in the table");
+        for name in LAUNCHER_NAMES {
+            let path = format!("/repo/tools/{name}");
+            assert!(opens_as_program(&path), "{path} must count as a program");
+            assert_eq!(decide(&path, vec![(path.as_str(), text())]).map(|d| d.action), Some(OpenAction::Reveal), "{path}");
+        }
+    }
+
+    #[test]
+    fn leaves_text_files_dotted_folders_and_a_trailing_dot_segment_alone() {
+        for path in ["/repo/notes.txt", "/repo/dir.sh/readme", "/repo/.config/notes", "/repo/src/.", "/repo/Makefile"] {
+            assert!(!opens_as_program(path), "{path} must not count as a program");
+        }
+        assert_eq!(
+            decide("/repo/src/.", vec![("/repo/src/.", with_real(text(), "/repo/src"))]),
+            Some(OpenPathTarget { action: OpenAction::Open, path: "/repo/src".into() })
+        );
+    }
 }

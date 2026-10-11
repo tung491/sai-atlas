@@ -273,6 +273,50 @@ pub(crate) fn missing_pack_message(file: &str, packaged: bool) -> String {
     format!("The assistant pack is missing {file} in this installation. Reinstall {PRODUCT_NAME}, then relaunch.")
 }
 
+/// The spawn flags `scripts/assistant-pack.ts` (`assistantPackFlags`) builds
+/// for `pack_dir`, read from its source: the pack check validates that copy,
+/// so the tests hold the shipped flags to it. Each array item sits on its own
+/// line; an expression this reader does not know fails the test.
+#[cfg(test)]
+pub(crate) fn ts_pack_flags(pack_dir: &Path) -> Vec<String> {
+    let source = include_str!("../../../scripts/assistant-pack.ts");
+    let array = |name: &str| -> Vec<String> {
+        let header = format!("const {name} = [");
+        let start = source.find(&header).unwrap_or_else(|| panic!("{name} missing"));
+        let body = &source[start + header.len()..];
+        body[..body.find("];").unwrap()].split(',').map(|item| item.trim().trim_matches('"').to_string()).filter(|item| !item.is_empty()).collect()
+    };
+    let start = source.find("export function assistantPackFlags(packDir: string): string[] {").expect("assistantPackFlags missing");
+    let body = &source[start..];
+    let body = &body[..body.find("\n}\n").expect("assistantPackFlags has no end")];
+    let tools_line = body.lines().map(str::trim).find(|line| line.starts_with("const tools = [")).expect("the tool list");
+    let tools: Vec<String> = tools_line["const tools = [".len()..tools_line.find("];").expect("the tool list ends")]
+        .split(',')
+        .map(|item| item.trim().strip_prefix("...").unwrap_or_else(|| panic!("unexpected tool item {item}")))
+        .flat_map(array)
+        .collect();
+    let items = &body[body.find("return [").expect("the returned flags") + "return [".len()..body.rfind("];").unwrap()];
+    items
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .map(|line| {
+            let item = line.strip_suffix(',').unwrap_or(line);
+            if let Some(literal) = item.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+                literal.to_string()
+            } else if item == "packDir" {
+                pack_dir.to_string_lossy().into_owned()
+            } else if item == "tools.join(\",\")" {
+                tools.join(",")
+            } else if let Some(file) = item.strip_prefix("join(packDir, \"").and_then(|rest| rest.strip_suffix("\")")) {
+                pack_dir.join(file).to_string_lossy().into_owned()
+            } else {
+                panic!("unknown flag expression {item}")
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +370,12 @@ mod tests {
             "always-ask",
         ]);
         assert_eq!(pack_flags(pack), expected);
+    }
+
+    #[test]
+    fn ships_the_spawn_flags_the_pack_check_validates() {
+        let pack = Path::new("/opt/pack");
+        assert_eq!(pack_flags(pack), ts_pack_flags(pack));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::ctx::AppCtx;
-use crate::ports::{Caller, WindowId};
+use crate::ports::{Caller, HostError, WindowId};
 
 use super::open_path_target::{self, OpenAction, OsFs};
 
@@ -42,6 +42,15 @@ pub fn sanitize_external_url(url: &str) -> Option<String> {
     }
     let fields: Vec<&str> = query.map(|query| query.split('&').filter(|field| is_kept_mailto_field(field)).collect()).unwrap_or_default();
     Some(if fields.is_empty() { format!("{MAILTO}{address}") } else { format!("{MAILTO}{address}?{}", fields.join("&")) })
+}
+
+/// What a [`Host`](crate::ports::Host)'s `open_url` hands to the OS, checked
+/// again whoever asks: only http, https and a mailto link reduced to its
+/// address, subject, body, cc and bcc. The real host and the test host both
+/// call this, so the guard the tests see is the one that ships.
+pub fn host_open_url_target(url: &str) -> Result<String, HostError> {
+    sanitize_external_url(url)
+        .ok_or_else(|| HostError::Failed(format!("refused to open a URL that is not http, https or mailto: {url}")))
 }
 
 fn is_kept_mailto_field(field: &str) -> bool {
@@ -193,7 +202,7 @@ pub async fn open_path(
 mod tests {
     use super::*;
     use crate::bridge::{self, Registry};
-    use crate::ports::{Caller, WindowId};
+    use crate::ports::{Caller, Host, WindowId};
     use crate::testing::{self, Fakes};
     use serde_json::json;
     use std::sync::Arc as StdArc;
@@ -265,6 +274,22 @@ mod tests {
     }
 
     #[test]
+    fn the_host_opens_only_a_sanitized_url_and_refuses_any_other_scheme() {
+        assert_eq!(host_open_url_target("https://a.b/x"), Ok("https://a.b/x".to_string()));
+        assert_eq!(host_open_url_target("mailto:a@b.c?attach=/etc/passwd&subject=x"), Ok("mailto:a@b.c?subject=x".to_string()));
+        for url in ["file:///etc/passwd", "javascript:alert(1)", "smb://host/share", "mailto:a@b.c%3Fattach=/etc/passwd", ""] {
+            assert!(matches!(host_open_url_target(url), Err(HostError::Failed(_))), "{url} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_test_host_applies_the_same_url_guard() {
+        let host = testing::FakeHost::new();
+        assert_eq!(host.open_url("https://a.b"), Ok(()));
+        assert!(host.open_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
     fn the_host_tool_still_refuses_mailto_urls() {
         assert!(allowed_web_url("https://a.b"));
         assert!(!allowed_web_url("mailto:a@b.c"));
@@ -331,6 +356,21 @@ mod tests {
         let result = bridge::dispatch_for_test(&ctx, caller, "system:open-path", vec![json!("notes.md")]).await.unwrap();
         assert_eq!(result["ok"], json!(true));
         assert!(fakes.host.log.calls().iter().any(|call| call.starts_with("open_path(")));
+    }
+
+    #[tokio::test]
+    async fn dispatches_system_open_path_for_a_launcher_as_a_reveal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x.desktop"), "[Desktop Entry]\nExec=sh -c 'echo pwned'\n").unwrap();
+        let fakes = Fakes::default();
+        fakes.tabs.cwds.lock().unwrap().insert(WindowId(1), dir.path().to_string_lossy().into_owned());
+        let ctx = services_ctx(&fakes);
+        let caller = Caller::main(WindowId(1));
+        let result = bridge::dispatch_for_test(&ctx, caller, "system:open-path", vec![json!("x.desktop")]).await.unwrap();
+        assert_eq!(result["ok"], json!(true));
+        let calls = fakes.host.log.calls();
+        assert!(calls.iter().any(|call| call.starts_with("reveal_in_folder(") && call.ends_with("x.desktop)")), "{calls:?}");
+        assert!(!calls.iter().any(|call| call.starts_with("open_path(")), "a launcher is never opened: {calls:?}");
     }
 
     /// Window `/win` with tabs `t1` → `/ws/one` and `t2` → `/ws/two`; records which tab was asked for.

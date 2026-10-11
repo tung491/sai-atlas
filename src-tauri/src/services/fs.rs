@@ -337,6 +337,23 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_sibling_that_shares_the_root_prefix_and_an_absolute_path() {
+        let root = Path::new("/ws/two");
+        assert_eq!(resolve_within(root, "../two-secrets/x"), None);
+        assert_eq!(resolve_within(root, "../two"), Some(PathBuf::from("/ws/two")));
+        assert_eq!(resolve_within(root, "/etc/passwd"), None);
+        assert_eq!(resolve_within(root, "/ws/two-secrets/x"), None);
+    }
+
+    #[test]
+    fn resolves_an_empty_or_dot_path_to_the_root_itself() {
+        let root = Path::new("/ws/two");
+        assert_eq!(resolve_within(root, ""), Some(PathBuf::from("/ws/two")));
+        assert_eq!(resolve_within(root, "."), Some(PathBuf::from("/ws/two")));
+        assert_eq!(resolve_within(root, "a/../b"), Some(PathBuf::from("/ws/two/b")));
+    }
+
+    #[test]
     fn reads_absolute_paths_unconfined_like_the_ts_handler() {
         let dir = tempfile::tempdir().unwrap();
         let outside = dir.path().join("secret.txt");
@@ -367,17 +384,28 @@ mod tests {
     }
 
     #[test]
-    fn refuses_images_above_the_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("big.png");
-        std::fs::write(&path, vec![0u8; 10]).unwrap();
-        let size = std::fs::metadata(&path).unwrap().len();
-        assert!(size <= FS_IMAGE_MAX_BYTES, "sanity: the fixture is not actually oversize");
-        // The handler itself performs the cap comparison; this proves the sniff
-        // path used alongside it recognizes a real PNG header independent of size.
+    fn sniffs_a_png_header() {
         let mut header = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         header.resize(16, 0);
         assert_eq!(sniff_image_mime(&header), Some("image/png"));
+    }
+
+    #[test]
+    fn sniffs_no_image_type_in_text_keys_or_truncated_and_lookalike_headers() {
+        let cases: [(&str, &[u8]); 9] = [
+            ("empty", b""),
+            ("a PEM key", b"-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n"),
+            ("plain text", b"just some notes, nothing to see\n"),
+            ("html", b"<!doctype html><html><body>hi</body></html>"),
+            ("xml without svg", b"<?xml version=\"1.0\"?><plist></plist>"),
+            ("a truncated png signature", &[0x89, 0x50, 0x4e, 0x47]),
+            ("a RIFF that is not WEBP", b"RIFF\x24\x00\x00\x00WAVEfmt "),
+            ("an ftyp that is not AVIF", b"\x00\x00\x00\x18ftypmp42\x00\x00"),
+            ("a zip", &[0x50, 0x4b, 0x03, 0x04, 0x14, 0x00]),
+        ];
+        for (name, header) in cases {
+            assert_eq!(sniff_image_mime(header), None, "{name} must not sniff as an image");
+        }
     }
 
     #[test]

@@ -1,0 +1,9 @@
+{
+	"openPathInTab": { "channel": "system:open-path", "args": ["a.pdf", { "tabId": "t2" }] },
+	"openPathWithoutTab": { "channel": "system:open-path", "args": ["b.md"] },
+	"readDocumentInTabIfChanged": {
+		"channel": "fs:read-document",
+		"args": [{ "path": "docs/a.docx", "tabId": "t1", "ifChanged": { "size": 3, "mtimeMs": 7 } }]
+	},
+	"readImageInTab": { "channel": "fs:read-image", "args": [{ "path": "img/a.png", "tabId": "t2" }] }
+}

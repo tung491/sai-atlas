@@ -838,12 +838,32 @@ mod tests {
         let entries: Vec<Entry> = serde_json::from_str(include_str!("../contracts/cross-module-calls.json")).unwrap();
         assert!(entries.len() >= 40);
         let source = include_str!("ports.rs");
-        let modules = ["foundation", "omp", "tabs", "desktop", "services", "ollama", "updater"];
+        // The traits each module implements: the method must be declared in one of them.
+        let traits: &[(&str, &[&str])] = &[
+            ("foundation", &["Host"]),
+            ("omp", &["OmpPort", "SidecarHandle", "EventBatcher"]),
+            ("tabs", &["TabsPort"]),
+            ("desktop", &["DesktopPort"]),
+            ("services", &["ServicesPort"]),
+            ("ollama", &["OllamaPort"]),
+            ("updater", &["UpdaterPort"]),
+        ];
+        let trait_block = |name: &str| -> &str {
+            let start = source.find(&format!("\npub trait {name}: ")).unwrap_or_else(|| panic!("no trait {name}"));
+            let body = &source[start..];
+            &body[..body.find("\n}\n").unwrap_or_else(|| panic!("trait {name} has no end"))]
+        };
         for entry in entries {
-            assert!(modules.contains(&entry.caller.as_str()), "unknown caller {}", entry.caller);
-            assert!(modules.contains(&entry.callee.as_str()), "unknown callee {}", entry.callee);
+            assert!(traits.iter().any(|(module, _)| *module == entry.caller), "unknown caller {}", entry.caller);
+            let (_, callee_traits) = traits.iter().find(|(module, _)| *module == entry.callee).unwrap_or_else(|| panic!("unknown callee {}", entry.callee));
             let needle = format!("fn {}(", entry.method);
-            assert!(source.contains(&needle), "{} ({} -> {}) has no trait method", entry.method, entry.caller, entry.callee);
+            assert!(
+                callee_traits.iter().any(|name| trait_block(name).contains(&needle)),
+                "{} ({} -> {}) is not a method of {callee_traits:?}",
+                entry.method,
+                entry.caller,
+                entry.callee
+            );
         }
     }
 

@@ -182,11 +182,7 @@ impl Host for TauriHost {
     }
 
     fn open_url(&self, url: &str) -> Result<(), HostError> {
-        // Checked again here, whoever asks: only http, https and a mailto
-        // link reduced to its address, subject, body, cc and bcc reach the OS.
-        let Some(target) = services::system::sanitize_external_url(url) else {
-            return Err(HostError::Failed(format!("refused to open a URL that is not http, https or mailto: {url}")));
-        };
+        let target = services::system::host_open_url_target(url)?;
         self.app.opener().open_url(target, None::<&str>).map_err(|error| HostError::Failed(error.to_string()))
     }
 

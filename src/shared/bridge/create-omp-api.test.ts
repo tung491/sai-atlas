@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { IPC_COMMANDS, IPC_EVENTS } from "../ipc-types";
 import { createOmpApi } from "./create-omp-api";
+// Shared with the Rust handlers' tests (`src-tauri/src/services/ipc.rs`), so
+// both sides read the same wire shape instead of two hand-written copies.
+import payloads from "./ipc-payload-fixtures.json";
 import type { IpcPort } from "./ipc-port";
 
 interface Call {
@@ -223,12 +226,15 @@ describe("createOmpApi", () => {
 		await expect(
 			api.fs.readDocument("docs/a.docx", { tabId: "t1", ifChanged: { size: 3, mtimeMs: 7 } }),
 		).resolves.toEqual({ ok: true, unchanged: true, size: 3, mtimeMs: 7 });
-		expect(invokes).toEqual([
-			{
-				channel: IPC_COMMANDS.FS_READ_DOCUMENT,
-				args: [{ path: "docs/a.docx", tabId: "t1", ifChanged: { size: 3, mtimeMs: 7 } }],
-			},
-		]);
+		expect(invokes).toEqual([payloads.readDocumentInTabIfChanged]);
+		expect(payloads.readDocumentInTabIfChanged.channel).toBe(IPC_COMMANDS.FS_READ_DOCUMENT);
+	});
+
+	it("reads an image with the tab it belongs to", async () => {
+		const { port, invokes } = fakePort();
+		await createOmpApi(port, "linux").fs.readImage("img/a.png", "t2");
+		expect(invokes).toEqual([payloads.readImageInTab]);
+		expect(payloads.readImageInTab.channel).toBe(IPC_COMMANDS.FS_READ_IMAGE);
 	});
 
 	it("watches a preview with its tab, unwatches by id, and streams settled changes by watch id", async () => {
@@ -266,10 +272,12 @@ describe("createOmpApi", () => {
 		await api.system.openPath("b.md");
 		await api.system.openPath("c.md", {});
 		expect(invokes).toEqual([
-			{ channel: IPC_COMMANDS.SYSTEM_OPEN_PATH, args: ["a.pdf", { tabId: "t2" }] },
-			{ channel: IPC_COMMANDS.SYSTEM_OPEN_PATH, args: ["b.md"] },
+			payloads.openPathInTab,
+			payloads.openPathWithoutTab,
 			{ channel: IPC_COMMANDS.SYSTEM_OPEN_PATH, args: ["c.md"] },
 		]);
+		expect(payloads.openPathInTab.channel).toBe(IPC_COMMANDS.SYSTEM_OPEN_PATH);
+		expect(payloads.openPathWithoutTab.channel).toBe(IPC_COMMANDS.SYSTEM_OPEN_PATH);
 	});
 
 	it("delivers native drop paths only when the shell emits them, dropping malformed entries", () => {

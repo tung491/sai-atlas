@@ -1090,35 +1090,11 @@ pub(crate) mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("resources").join("assistant-pack")
     }
 
-    /// The `--tools` value of the spawn contract.
-    fn pack_tools() -> &'static str {
-        "read,glob,write,ask,diagnose,system_status,open_item,os_setting,office_report,office_slides,office_clean"
-    }
-
-    /// The pack part of the spawn argv, written out so the test does not restate the code it checks.
-    fn expected_pack_flags(pack: &Path) -> Vec<String> {
-        vec![
-            "--no-extensions".to_string(),
-            "--no-rules".to_string(),
-            "--no-context-files".to_string(),
-            "--extension".to_string(),
-            pack.to_string_lossy().into_owned(),
-            "--tools".to_string(),
-            pack_tools().to_string(),
-            "--system-prompt".to_string(),
-            pack.join("system-prompt.md").to_string_lossy().into_owned(),
-            "--append-system-prompt".to_string(),
-            pack.join("append-system-prompt.md").to_string_lossy().into_owned(),
-            "--config".to_string(),
-            pack.join("config.yml").to_string_lossy().into_owned(),
-            "--approval-mode".to_string(),
-            "always-ask".to_string(),
-        ]
-    }
-
     fn argv(head: &[&str], pack: &Path, tail: &[&str]) -> Vec<String> {
         let mut argv: Vec<String> = head.iter().map(|arg| arg.to_string()).collect();
-        argv.extend(expected_pack_flags(pack));
+        // The pack flags come from the pack check's copy (`scripts/assistant-pack.ts`),
+        // so the test does not restate the code it checks.
+        argv.extend(assistant_pack::ts_pack_flags(pack));
         argv.extend(tail.iter().map(|arg| arg.to_string()));
         argv
     }
@@ -1318,27 +1294,7 @@ pub(crate) mod tests {
         assert_eq!(child_env.get("OPENAI_API_KEY"), None);
         assert_eq!(child_env.get("OLLAMA_CLOUD_API_KEY"), None);
         assert_eq!(child_env.get("OLLAMA_HOST").map(String::as_str), Some("127.0.0.1:11434"));
-        let pack = dev_pack();
-        let expected = vec![
-            "--mode".to_string(),
-            "rpc-ui".to_string(),
-            "--no-auto-resume".to_string(),
-            "--no-extensions".to_string(),
-            "--no-rules".to_string(),
-            "--no-context-files".to_string(),
-            "--extension".to_string(),
-            pack.to_string_lossy().into_owned(),
-            "--tools".to_string(),
-            pack_tools().to_string(),
-            "--system-prompt".to_string(),
-            pack.join("system-prompt.md").to_string_lossy().into_owned(),
-            "--append-system-prompt".to_string(),
-            pack.join("append-system-prompt.md").to_string_lossy().into_owned(),
-            "--config".to_string(),
-            pack.join("config.yml").to_string_lossy().into_owned(),
-            "--approval-mode".to_string(),
-            "always-ask".to_string(),
-        ];
+        let expected = argv(&["--mode", "rpc-ui", "--no-auto-resume"], &dev_pack(), &[]);
         assert_eq!(launch, expected);
         assert!(!launch.iter().any(|arg| arg == "--chat"));
     }

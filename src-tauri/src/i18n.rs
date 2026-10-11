@@ -206,6 +206,28 @@ mod tests {
         assert_eq!(fill_placeholders("{ not a param", &[]), "{ not a param");
     }
 
+    /// The `{name}` placeholders `fill_placeholders` would fill in `text`.
+    fn placeholders(text: &str) -> std::collections::BTreeSet<&str> {
+        text.split('{')
+            .skip(1)
+            .filter_map(|rest| rest.split_once('}').map(|(name, _)| name))
+            .filter(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            .collect()
+    }
+
+    #[test]
+    fn every_shell_string_has_a_vietnamese_mirror_with_the_same_placeholders() {
+        // Strings that read the same in both languages (a product or format name).
+        const SAME_IN_BOTH: &[MainTextKey] = &[];
+        for key in MainTextKey::ALL {
+            let (en, vi) = (key.text(MainLanguage::En), key.text(MainLanguage::Vi));
+            assert!(!en.trim().is_empty() && !vi.trim().is_empty(), "{} has an empty text", key.key());
+            assert_eq!(placeholders(en), placeholders(vi), "{} has different placeholders in en and vi", key.key());
+            assert_eq!(en == vi, SAME_IN_BOTH.contains(key), "{} is untranslated or wrongly allowlisted", key.key());
+        }
+        assert_eq!(placeholders("{working} of {total} in {windows} {} { x}"), ["total", "windows", "working"].into());
+    }
+
     #[test]
     fn prefers_the_language_pref_over_the_system_locale() {
         let dir = tempfile::tempdir().unwrap();

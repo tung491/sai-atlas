@@ -17,7 +17,7 @@ mod quick_entry;
 mod quick_entry_core;
 mod quit_guard;
 mod shortcut;
-mod shortcut_core;
+pub(crate) mod shortcut_core;
 mod tab_layout;
 mod tray;
 mod tray_labels;

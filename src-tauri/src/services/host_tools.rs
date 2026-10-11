@@ -58,8 +58,12 @@ mod tests {
         let ctx = ctx(&fakes);
         let result = execute(&ctx, "gui_open_url", &serde_json::json!({ "url": "https://example.com" })).unwrap().await.unwrap();
         assert_eq!(result, Value::String("Opened in browser".into()));
+        assert_eq!(fakes.host.log.calls(), ["open_url(https://example.com)"]);
         let refused = execute(&ctx, "gui_open_url", &serde_json::json!({ "url": "file:///etc/passwd" })).unwrap().await.unwrap();
         assert_eq!(refused, Value::String("Invalid URL: file:///etc/passwd".into()));
+        let mailto = execute(&ctx, "gui_open_url", &serde_json::json!({ "url": "mailto:a@b.c" })).unwrap().await.unwrap();
+        assert_eq!(mailto, Value::String("Invalid URL: mailto:a@b.c".into()));
+        assert_eq!(fakes.host.log.calls(), ["open_url(https://example.com)"], "a refused URL never reaches the host");
     }
 
     #[tokio::test]

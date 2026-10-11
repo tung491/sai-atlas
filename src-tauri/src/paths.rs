@@ -393,6 +393,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "e2e-hooks"))]
+    fn a_shipped_build_ignores_the_fixture_sidecar_variable() {
+        // Only this test sets the variable, and only in a build without the hooks.
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("sidecar-fixture.ts");
+        std::fs::write(&fixture, "").unwrap();
+        std::env::set_var("OMP_BUNDLED_OMP", &fixture);
+        let resolved = resolve_bundled_omp();
+        std::env::remove_var("OMP_BUNDLED_OMP");
+        // Either the development sidecar or a missing-binary error, never the fixture.
+        assert_ne!(resolved.ok(), Some(fixture), "a shipped build must run its own bundled sidecar");
+    }
+
+    #[test]
     fn falls_back_to_the_executable_dir_and_errors_when_nothing_is_bundled() {
         let root = tempfile::tempdir().unwrap();
         let exe_dir = root.path().join("bin");
@@ -406,9 +420,9 @@ mod tests {
     }
 
     #[test]
-    fn skips_the_volume_root_which_is_what_a_finder_launch_reports_as_cwd() {
+    fn skips_the_volume_root_which_is_what_a_desktop_launch_can_report_as_cwd() {
         let exists = |_: &str| true;
-        assert_eq!(first_usable_cwd(&[Some("/"), Some("/Users/me/work")], exists), Some("/Users/me/work".into()));
+        assert_eq!(first_usable_cwd(&[Some("/"), Some("/home/me/work")], exists), Some("/home/me/work".into()));
         assert_eq!(first_usable_cwd(&[Some("/")], exists), None);
     }
 

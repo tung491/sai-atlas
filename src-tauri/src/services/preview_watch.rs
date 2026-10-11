@@ -193,7 +193,7 @@ impl Inner {
         let debounce = self.debounce;
         std::thread::Builder::new()
             .name("preview-watch".to_string())
-            .spawn(move || run_worker(&weak, &inbox, debounce))
+            .spawn(move || run_worker(&weak, &inbox, debounce, &SystemClock))
             .ok()?;
         *worker = Some(sender.clone());
         Some(sender)
@@ -295,24 +295,42 @@ fn watch_target(path: &Path) -> Option<PathBuf> {
     Some(parent.join(name))
 }
 
+/// The worker's time source and inbox wait, so a test drives the debounce
+/// on virtual time instead of real sleeps.
+trait WorkerClock {
+    fn now(&self) -> Instant;
+    /// The next message, waiting until `deadline` (forever when `None`).
+    fn recv(&self, inbox: &Receiver<Msg>, deadline: Option<Instant>) -> Result<Msg, RecvTimeoutError>;
+}
+
+/// The real clock: `Instant::now` and a blocking receive.
+struct SystemClock;
+
+impl WorkerClock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn recv(&self, inbox: &Receiver<Msg>, deadline: Option<Instant>) -> Result<Msg, RecvTimeoutError> {
+        match deadline {
+            None => inbox.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(deadline) => inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+        }
+    }
+}
+
 /// The debounce loop: each touched watch fires `debounce` after its last touch.
-fn run_worker(inner: &Weak<Inner>, inbox: &Receiver<Msg>, debounce: Duration) {
+fn run_worker(inner: &Weak<Inner>, inbox: &Receiver<Msg>, debounce: Duration, clock: &impl WorkerClock) {
     let mut due: HashMap<String, Instant> = HashMap::new();
     loop {
-        let message = match due.values().min().copied() {
-            None => match inbox.recv() {
-                Ok(message) => Some(message),
-                Err(_) => return,
-            },
-            Some(next) => match inbox.recv_timeout(next.saturating_duration_since(Instant::now())) {
-                Ok(message) => Some(message),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => return,
-            },
+        let message = match clock.recv(inbox, due.values().min().copied()) {
+            Ok(message) => Some(message),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return,
         };
         match message {
             Some(Msg::Touch(ids)) => {
-                let at = Instant::now() + debounce;
+                let at = clock.now() + debounce;
                 due.extend(ids.into_iter().map(|id| (id, at)));
             }
             Some(Msg::Release(dirs)) => {
@@ -322,7 +340,7 @@ fn run_worker(inner: &Weak<Inner>, inbox: &Receiver<Msg>, debounce: Duration) {
             }
             None => {}
         }
-        let now = Instant::now();
+        let now = clock.now();
         let fired: Vec<String> = due.iter().filter(|(_, at)| **at <= now).map(|(id, _)| id.clone()).collect();
         if fired.is_empty() {
             continue;
@@ -448,21 +466,103 @@ mod tests {
         std::thread::sleep(TEST_DEBOUNCE * 4);
     }
 
+    type Step = (Duration, Box<dyn FnOnce()>);
+
+    /// Virtual time for the worker: a wait with nothing queued runs the next
+    /// scripted step at its offset, or jumps to the worker's deadline when that
+    /// comes first. With no step and no deadline left the worker stops.
+    struct ScriptedClock {
+        start: Instant,
+        now: Arc<Mutex<Instant>>,
+        steps: std::cell::RefCell<VecDeque<Step>>,
+    }
+
+    impl WorkerClock for ScriptedClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+
+        fn recv(&self, inbox: &Receiver<Msg>, deadline: Option<Instant>) -> Result<Msg, RecvTimeoutError> {
+            loop {
+                match inbox.try_recv() {
+                    Ok(message) => return Ok(message),
+                    Err(mpsc::TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+                let next = self.steps.borrow().front().map(|(offset, _)| self.start + *offset);
+                if let Some(at) = next.filter(|at| deadline.is_none_or(|deadline| *at < deadline)) {
+                    let (_, step) = self.steps.borrow_mut().pop_front().unwrap();
+                    *self.now.lock().unwrap() = at;
+                    step();
+                    continue;
+                }
+                let Some(deadline) = deadline else { return Err(RecvTimeoutError::Disconnected) };
+                *self.now.lock().unwrap() = deadline;
+                return Err(RecvTimeoutError::Timeout);
+            }
+        }
+    }
+
+    /// Watches on `target` driven on virtual time: the test runs the worker
+    /// itself and no directory is watched, so a write arrives as the event the
+    /// watcher would report. Fires are recorded with their virtual offset.
+    struct VirtualWatches {
+        watches: PreviewWatches,
+        inbox: Receiver<Msg>,
+        start: Instant,
+        now: Arc<Mutex<Instant>>,
+        fired: Arc<Mutex<Vec<(String, Duration)>>>,
+        target: PathBuf,
+    }
+
+    impl VirtualWatches {
+        fn new(ids: &[&str]) -> Self {
+            let start = Instant::now();
+            let now = Arc::new(Mutex::new(start));
+            let fired: Arc<Mutex<Vec<(String, Duration)>>> = Arc::default();
+            let (clock_now, sink) = (now.clone(), fired.clone());
+            let listener: ChangeListener =
+                Arc::new(move |_, watch_id| sink.lock().unwrap().push((watch_id.to_string(), *clock_now.lock().unwrap() - start)));
+            let watches = PreviewWatches::new(TEST_DEBOUNCE, listener);
+            let (sender, inbox) = mpsc::channel();
+            *lock(&watches.inner.worker) = Some(sender);
+            let target = PathBuf::from("/work/report.docx");
+            {
+                let mut entries = lock(&watches.inner.entries);
+                for id in ids {
+                    entries.by_id.insert((*id).into(), Entry { win_id: WindowId(1), target: target.clone(), dir: PathBuf::from("/work") });
+                    entries.by_window.entry(WindowId(1)).or_default().push_back((*id).into());
+                }
+            }
+            Self { watches, inbox, start, now, fired, target }
+        }
+
+        fn write(&self) -> Box<dyn FnOnce()> {
+            let inner = self.watches.inner.clone();
+            let event = notify::Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write))).add_path(self.target.clone());
+            Box::new(move || inner.on_event(&event))
+        }
+
+        fn unwatch(&self, watch_id: &'static str) -> Box<dyn FnOnce()> {
+            let watches = PreviewWatches { inner: self.watches.inner.clone() };
+            Box::new(move || watches.unwatch(watch_id))
+        }
+
+        /// Runs the worker through `steps` until nothing is left to do.
+        fn run(&self, steps: Vec<Step>) -> Vec<(String, Duration)> {
+            let clock = ScriptedClock { start: self.start, now: self.now.clone(), steps: std::cell::RefCell::new(steps.into()) };
+            run_worker(&Arc::downgrade(&self.watches.inner), &self.inbox, TEST_DEBOUNCE, &clock);
+            self.fired.lock().unwrap().clone()
+        }
+    }
+
     #[test]
     fn preview_watch_fires_once_after_changes_settle() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("report.docx");
-        std::fs::write(&file, "v0").unwrap();
-        let (watches, fired) = watches();
-        let id = watches.watch(WindowId(1), &file).unwrap();
-        for round in 1..=4 {
-            std::fs::write(&file, format!("v{round}")).unwrap();
-            std::thread::sleep(TEST_DEBOUNCE / 6);
-        }
-        assert_eq!(fired_for(&fired, &id), 0, "nothing fires while the writes keep coming");
-        assert!(wait_for(&fired, &id, Duration::from_secs(5)), "the watch fires after the writes settle");
-        settle();
-        assert_eq!(fired.lock().unwrap().clone(), vec![(WindowId(1), id)]);
+        let watches = VirtualWatches::new(&["w"]);
+        // Four writes, each well inside the quiet period of the one before.
+        let fired = watches.run((0..4u32).map(|round| (TEST_DEBOUNCE / 6 * round, watches.write())).collect());
+        // One fire, a full quiet period after the last write, and none while the writes kept coming.
+        assert_eq!(fired, vec![("w".to_string(), TEST_DEBOUNCE / 6 * 3 + TEST_DEBOUNCE)]);
     }
 
     #[test]
@@ -561,23 +661,17 @@ mod tests {
 
     #[test]
     fn preview_unwatch_stops_further_events() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("report.docx");
-        std::fs::write(&file, "v0").unwrap();
-        let (watches, fired) = watches();
-        let id = watches.watch(WindowId(1), &file).unwrap();
-        let pending = watches.watch(WindowId(1), &file).unwrap();
-        std::fs::write(&file, "v1").unwrap();
-        // Unwatched while its debounce is still running: it never fires.
-        watches.unwatch(&pending);
-        assert!(wait_for(&fired, &id, Duration::from_secs(5)));
-        watches.unwatch(&id);
-        watches.unwatch("unknown");
-        std::fs::write(&file, "v2").unwrap();
-        settle();
-        assert_eq!(fired_for(&fired, &id), 1);
-        assert_eq!(fired_for(&fired, &pending), 0);
-        assert_eq!(watches.watch_count(WindowId(1)), 0);
+        let watches = VirtualWatches::new(&["kept", "pending"]);
+        let fired = watches.run(vec![
+            (Duration::ZERO, watches.write()),
+            // Unwatched while its debounce is still running: it never fires.
+            (TEST_DEBOUNCE / 2, watches.unwatch("pending")),
+            (TEST_DEBOUNCE * 2, watches.unwatch("kept")),
+            (TEST_DEBOUNCE * 2, watches.unwatch("unknown")),
+            (TEST_DEBOUNCE * 3, watches.write()),
+        ]);
+        assert_eq!(fired, vec![("kept".to_string(), TEST_DEBOUNCE)]);
+        assert_eq!(watches.watches.watch_count(WindowId(1)), 0);
     }
 
     #[test]

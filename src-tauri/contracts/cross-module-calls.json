@@ -226,11 +226,6 @@
   },
   {
     "caller": "foundation",
-    "callee": "omp",
-    "method": "shutdown"
-  },
-  {
-    "caller": "foundation",
     "callee": "services",
     "method": "shutdown"
   },
@@ -271,7 +266,7 @@
   },
   {
     "caller": "updater",
-    "callee": "updater",
+    "callee": "foundation",
     "method": "relaunch_after_exit"
   },
   {

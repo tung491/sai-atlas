@@ -1284,6 +1284,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_the_quick_entry_submit_channel_from_a_main_window() {
+        // The scope the desktop module registers, in front of a probe: the real
+        // handler refuses a main window on its own, which would hide a broken bridge rule.
+        let mut production = Registry::new();
+        crate::desktop::register(&mut production);
+        let scope = production.scope_of("quick-entry:submit").expect("the desktop module registers quick-entry:submit");
+        let mut registry = Registry::new();
+        registry.register("quick-entry:submit", scope, echo);
+        let ctx = fake_ctx(registry);
+        attach(&ctx, main_caller(), "g1").await;
+        let payload = json!({ "text": "hi", "target": { "kind": "work" } });
+        let refused = ctx.bridge.invoke(&ctx, main_caller(), "g1".into(), 0, "quick-entry:submit".into(), vec![payload]).await;
+        assert_eq!(refused, Err(IpcError::wrong_scope("quick-entry:submit")));
+    }
+
+    #[tokio::test]
     async fn an_unregistered_window_drops_the_message() {
         let ctx = ctx();
         ctx.bridge.emit_to_window(WindowId(9), "sessions:changed", Value::Null);
