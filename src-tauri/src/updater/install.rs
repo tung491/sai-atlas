@@ -443,6 +443,17 @@ pub(crate) mod tests {
         assert!(runner.calls.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn verifies_a_package_against_the_release_s_sha512() {
+        let dir = tempfile::tempdir().unwrap();
+        let (package, sha) = downloaded_package(&dir).await;
+        assert_eq!(verify_package(&package, &sha).await, Ok(()));
+        tokio::fs::write(&package, b"deb byteS").await.unwrap();
+        assert_eq!(verify_package(&package, &sha).await, Err(format!("{} no longer matches the release's SHA-512", package.display())));
+        let missing = dir.path().join("missing.AppImage");
+        assert!(verify_package(&missing, &sha).await.unwrap_err().contains("could not be hashed"));
+    }
+
     // AppImage swap
 
     #[tokio::test]

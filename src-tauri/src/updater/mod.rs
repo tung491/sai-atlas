@@ -1025,6 +1025,26 @@ mod tests {
         assert!(!partial.exists());
     }
 
+    #[tokio::test]
+    async fn download_writes_nothing_outside_the_download_directory() {
+        let (server, base) = start_server().await;
+        let deb = asset_bytes(4, 1_000);
+        // The name decodes to `../escape.deb`; the server serves it under the encoded segment.
+        *server.feed.lock().unwrap() = Some(format!("version: 0.9.16\nfiles:\n  - url: ..%2Fescape.deb\n    sha512: {}\n    size: {}\n", sha512_base64(&deb), deb.len()));
+        server.assets.lock().unwrap().insert("..%2Fescape.deb".into(), deb);
+        let h = harness(Setup { release_base: base, ..Setup::default() });
+
+        let check = h.call("updater:check").await;
+        let reply = h.call("updater:download").await;
+
+        assert_eq!(check, json!({ "state": "error", "message": h.ctx.i18n.t(MainTextKey::UpdatesInstallerMissing) }));
+        assert_eq!(reply, check, "nothing is downloaded");
+        let escaped = h.dir.path().join("escape.deb");
+        assert!(!escaped.exists());
+        assert!(!installer_partial_path(&escaped).exists());
+        assert_eq!(server.requests.lock().unwrap().len(), 1, "only the feed was fetched");
+    }
+
     // -- installs -----------------------------------------------------------------
 
     #[tokio::test]
@@ -1177,6 +1197,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_refuses_an_appimage_whose_bytes_changed_after_the_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let appimage = dir.path().join("Sai ATLAS.AppImage");
+        std::fs::write(&appimage, b"old image").unwrap();
+        let h = harness(Setup { kind: LinuxPackageKind::AppImage, appimage: Some(appimage.clone()), ..Setup::default() });
+        *h.fakes.desktop.approve_install.lock().unwrap() = true;
+        let package = h.seed_downloaded(UpdateInstallMode::Automatic, b"new image", APPIMAGE_NAME);
+        std::fs::write(&package, b"swapped").unwrap();
+
+        h.call("updater:apply").await;
+
+        assert_eq!(std::fs::read(&appimage).unwrap(), b"old image");
+        assert!(h.fakes.host.relaunches.lock().unwrap().is_empty());
+        assert!(h.fakes.host.exit_codes.lock().unwrap().is_empty());
+        assert!(!h.updater().inner().install_done);
+        assert_eq!(h.updater().status()["state"], "error");
+        assert!(h.updater().status()["message"].as_str().unwrap().contains("SHA-512"));
+        assert_eq!(h.fakes.desktop.log.calls(), ["approve_quit_before_install()", "withdraw_quit_approval()"]);
+    }
+
+    #[tokio::test]
     async fn apply_reports_a_missing_appimage_path() {
         let h = harness(Setup { kind: LinuxPackageKind::Other, appimage: None, ..Setup::default() });
         h.seed_downloaded(UpdateInstallMode::Automatic, b"new image", APPIMAGE_NAME);
@@ -1217,6 +1258,31 @@ mod tests {
         assert!(h.updater().inner().install_done);
         h.ctx.updater.shutdown().await;
         assert_eq!(std::fs::read(&appimage).unwrap(), b"new image");
+    }
+
+    #[tokio::test]
+    async fn shutdown_refuses_an_appimage_whose_bytes_changed_after_the_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let appimage = dir.path().join("Sai ATLAS.AppImage");
+        std::fs::write(&appimage, b"old image").unwrap();
+        let h = harness(Setup { kind: LinuxPackageKind::AppImage, appimage: Some(appimage.clone()), ..Setup::default() });
+        let package = h.seed_downloaded(UpdateInstallMode::Automatic, b"new image", APPIMAGE_NAME);
+        std::fs::write(&package, b"swapped").unwrap();
+
+        h.ctx.updater.shutdown().await;
+
+        assert_eq!(std::fs::read(&appimage).unwrap(), b"old image");
+        assert!(h.fakes.host.relaunches.lock().unwrap().is_empty());
+        assert!(h.fakes.host.exit_codes.lock().unwrap().is_empty());
+        assert!(!h.updater().inner().install_done);
+        assert_eq!(h.updater().status()["state"], "downloaded");
+        // Quitting shows no banner, so the refusal goes to the runtime log.
+        let log = std::fs::read_to_string(runtime_log::path()).unwrap_or_default();
+        let package = package.display().to_string();
+        assert!(
+            log.lines().any(|line| line.contains("the update could not be installed at quit") && line.contains("SHA-512") && line.contains(&package)),
+            "the refusal is in the runtime log"
+        );
     }
 
     #[tokio::test]

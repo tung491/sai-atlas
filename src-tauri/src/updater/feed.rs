@@ -126,7 +126,8 @@ pub(crate) struct Asset {
 
 /// Pick the asset for `target`: the file with the package extension,
 /// preferring one that names this CPU architecture, else the first, as
-/// electron-updater's `findFile` does.
+/// electron-updater's `findFile` does. A file whose name is not a plain file
+/// name (`release_file_name`) is never offered.
 pub(crate) fn select_asset(files: &[ReleaseFile], target: AssetTarget) -> Option<Asset> {
     let extension = match target {
         AssetTarget::LinuxAppImage => ".appimage",
@@ -134,7 +135,7 @@ pub(crate) fn select_asset(files: &[ReleaseFile], target: AssetTarget) -> Option
     };
     let named: Vec<(String, &ReleaseFile)> = files
         .iter()
-        .map(|file| (release_file_name(&file.url), file))
+        .filter_map(|file| Some((release_file_name(&file.url)?, file)))
         .filter(|(name, _)| name.to_lowercase().ends_with(extension))
         .collect();
     let arch = std::env::consts::ARCH;
@@ -202,13 +203,22 @@ releaseDate: '2026-09-30T10:00:00.000Z'
     }
 
     #[test]
+    fn ships_the_publishing_repository_s_https_release_base() {
+        assert_eq!(GITHUB_RELEASE_BASE, "https://github.com/tung491/sai-atlas/releases");
+        assert!(GITHUB_RELEASE_BASE.starts_with("https://"));
+        // A build-time override is only for test bundles reading a local feed.
+        if option_env!("SAI_ATLAS_UPDATE_BASE").is_none() {
+            assert_eq!(release_base(), GITHUB_RELEASE_BASE);
+        }
+    }
+
+    #[test]
     fn builds_the_feed_and_download_urls_from_one_base() {
-        let base = "https://github.com/tung491/sai-atlas/releases";
+        let base = GITHUB_RELEASE_BASE;
         assert_eq!(feed_url(base), format!("{base}/latest/download/{FEED_FILE}"));
         assert_eq!(feed_url(&format!("{base}/")), format!("{base}/latest/download/{FEED_FILE}"));
         assert_eq!(download_url(base, "0.9.16", "sai-atlas_0.9.16_amd64.deb"), format!("{base}/download/v0.9.16/sai-atlas_0.9.16_amd64.deb"));
         assert_eq!(download_url(base, "1.0.0-rc.1", "Sai ATLAS_1.0.0_x86_64.AppImage"), format!("{base}/download/v1.0.0-rc.1/Sai%20ATLAS_1.0.0_x86_64.AppImage"));
-        assert!(release_base().starts_with("http"));
     }
 
     #[test]
@@ -221,6 +231,25 @@ releaseDate: '2026-09-30T10:00:00.000Z'
         assert_eq!(select_asset(&feed.files, AssetTarget::LinuxAppImage).map(|asset| asset.name).as_deref(), Some("Sai-ATLAS-0.9.15-x86_64.AppImage"));
         let spaced = vec![file("https://example.test/download/Sai%20ATLAS-0.9.15-x86_64.AppImage", "appimage-hash")];
         assert_eq!(select_asset(&spaced, AssetTarget::LinuxAppImage).map(|asset| asset.name).as_deref(), Some("Sai ATLAS-0.9.15-x86_64.AppImage"));
+    }
+
+    #[test]
+    fn never_offers_an_asset_whose_name_leaves_the_download_directory() {
+        for url in [
+            "..%2Fsai-atlas_0.9.15_amd64.deb",
+            "..%2F..%2Fsai-atlas_0.9.15_amd64.deb",
+            "%2Fetc%2Fsai-atlas_0.9.15_amd64.deb",
+            "https://example.test/download/%2Fsai-atlas_0.9.15_amd64.deb",
+            "nested%2Fsai-atlas_0.9.15_amd64.deb",
+            "nested%5Csai-atlas_0.9.15_amd64.deb",
+            "sai-atlas%00_0.9.15_amd64.deb",
+            "..sai-atlas_0.9.15_amd64.deb",
+        ] {
+            assert_eq!(select_asset(&[file(url, "hash")], AssetTarget::LinuxDeb), None, "{url}");
+        }
+        // A rejected name does not hide a plain one next to it.
+        let files = vec![file("..%2Fsai-atlas_0.9.15_amd64.deb", "escape"), file("sai-atlas_0.9.15_amd64.deb", "plain")];
+        assert_eq!(select_asset(&files, AssetTarget::LinuxDeb).map(|asset| asset.sha512).as_deref(), Some("plain"));
     }
 
     #[test]

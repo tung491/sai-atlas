@@ -2,6 +2,7 @@
 //! `UpdateStatus`, resumable installer transfers and the Linux package-kind
 //! rules that decide how an update installs.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -76,7 +77,14 @@ pub(crate) struct ReleaseFile {
 
 /// The last path segment of `url`, percent-decoded; the raw string when it
 /// does not parse (matching `new URL(url, base)` plus `decodeURIComponent`).
-pub(crate) fn release_file_name(url: &str) -> String {
+/// `None` when that is not a plain file name: the name is joined onto the
+/// download directory, so a feed must not be able to steer the write elsewhere.
+pub(crate) fn release_file_name(url: &str) -> Option<String> {
+    let name = last_segment(url);
+    is_plain_file_name(&name).then_some(name)
+}
+
+fn last_segment(url: &str) -> String {
     let Ok(base) = reqwest::Url::parse("https://updates.invalid") else {
         return url.to_string();
     };
@@ -86,6 +94,12 @@ pub(crate) fn release_file_name(url: &str) -> String {
     let pathname = parsed.path();
     let segment = &pathname[pathname.rfind('/').map_or(0, |index| index + 1)..];
     percent_decode(segment).unwrap_or_else(|| url.to_string())
+}
+
+/// One path component naming a file in the directory it is joined onto: no
+/// separator, no NUL, no `..`, not absolute.
+fn is_plain_file_name(name: &str) -> bool {
+    !name.contains(['/', '\\', '\0']) && !name.contains("..") && Path::new(name).file_name() == Some(OsStr::new(name))
 }
 
 /// `decodeURIComponent`: `None` on a malformed escape or invalid UTF-8.
@@ -264,6 +278,18 @@ mod tests {
     use std::fs;
 
     const NO_RESULT: &str = "Update check completed without a result.";
+
+    // release file names
+
+    #[test]
+    fn names_a_release_file_only_by_a_plain_file_name() {
+        assert_eq!(release_file_name("https://example.test/download/v1/Sai%20ATLAS.AppImage").as_deref(), Some("Sai ATLAS.AppImage"));
+        // An empty last segment would name the download directory itself.
+        assert_eq!(release_file_name("https://example.test/download/"), None);
+        for name in ["", ".", "..", "/", "/abs.deb", "a/b.deb", "a\\b.deb", "a\0b.deb", "../b.deb"] {
+            assert!(!is_plain_file_name(name), "{name:?}");
+        }
+    }
 
     // update check terminal state
 
