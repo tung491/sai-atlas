@@ -10,7 +10,8 @@
 #   2. merge upstream/main (stop on conflict for manual resolution)
 #   3. bun install (lockfile may have moved)
 #   4. gen:stats (re-embed the stats dashboard client bundle)
-#   5. build:omp (rebuild the bundled sidecar with upstream + local changes)
+#   5. build:omp (check:protocol, then rebuild the bundled sidecar with upstream +
+#      local changes) + the assistant pack load check
 #   6. build the GUI renderer + typecheck + tests
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
@@ -49,7 +50,9 @@ bun install
 say "4/6 gen:stats (embed stats dashboard)"
 bun --cwd=packages/stats run gen:stats
 
-say "5/6 build:omp (rebuild bundled sidecar) + assistant pack load check"
+say "5/6 build:omp (protocol check, rebuild bundled sidecar) + assistant pack load check"
+# build:omp runs check:protocol before compiling, so a GUI/agent RPC protocol
+# mismatch from the merge stops the sync here.
 bun --cwd="$GUI" run build:omp
 "$GUI/resources/omp" --smoke-test
 # The new sidecar must still load the assistant pack exactly (tools, skills,

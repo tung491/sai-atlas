@@ -18,7 +18,7 @@
     "build:pack": "bun scripts/build-assistant-pack.ts",
     "build:omp": "bun scripts/build-bundled-omp.ts",
     "check": "node scripts/lint-surfaces.mjs && biome check . && tsc --noEmit",
-    "check:types": "tsc --noEmit && tsc --noEmit -p tsconfig.wdio.json",
+    "check:types": "tsc --noEmit && tsc --noEmit -p tsconfig.wdio.json && tsc --noEmit -p tsconfig.scripts.json",
     "check:protocol": "bun scripts/check-protocol.ts",
     "lint": "biome lint .",
     "fix": "biome check --write --unsafe .",

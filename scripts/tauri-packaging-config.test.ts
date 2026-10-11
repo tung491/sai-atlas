@@ -2,9 +2,7 @@
  * Tauri packaging contract: the identity, sandbox, sidecar placement, update
  * feeds and installer hooks every Tauri bundle must keep.
  */
-import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -17,7 +15,6 @@ import {
 	DEB_DEPENDS,
 	DEB_RECOMMENDS,
 	DESKTOP_ENTRY_ID,
-	finalizeDeb,
 	TRAY_ALTERNATION,
 	TRAY_DEPENDENCY,
 	WEBKIT_DEPENDENCY,
@@ -220,46 +217,51 @@ describe("sidecar placement", () => {
 });
 
 describe("renderer security", () => {
-	function cspSources(page: string, directive: string): string[] {
+	function metaCsp(page: string): string {
 		const html = fs.readFileSync(path.join(ROOT, "src/renderer", page), "utf8");
-		const content = /http-equiv="Content-Security-Policy"[^>]*content="([^"]+)"/.exec(html)?.[1];
+		const content = /http-equiv="Content-Security-Policy"\s+content="([^"]+)"/.exec(html)?.[1];
 		if (!content) throw new Error(`${page} declares no Content-Security-Policy`);
-		const entry = content
-			.split(";")
-			.map(part => part.trim())
-			.find(part => part.split(" ")[0] === directive);
-		if (!entry) throw new Error(`CSP declares no ${directive}`);
-		return entry.split(" ").slice(1);
+		return content;
 	}
 
+	/** The policy as directive → sources, refusing a directive declared twice (the browser ignores the second). */
+	function parseCsp(policy: string): Record<string, string[]> {
+		const parsed: Record<string, string[]> = {};
+		for (const part of policy.split(";")) {
+			const [directive, ...sources] = part.trim().split(/\s+/);
+			if (!directive) continue;
+			if (directive in parsed) throw new Error(`CSP declares ${directive} twice`);
+			parsed[directive] = sources;
+		}
+		return parsed;
+	}
+
+	// Every directive is pinned: img-src is explicit, not inherited, because without it the policy
+	// falls back to default-src and a later relaxation there would let markdown a model wrote fetch a
+	// remote image; script-src and connect-src keep script execution and network calls inside the app.
+	const EXPECTED_CSP = {
+		"default-src": ["'self'"],
+		"script-src": ["'self'"],
+		"style-src": ["'self'", "'unsafe-inline'"],
+		"font-src": ["'self'", "data:"],
+		"img-src": ["'self'", "data:", "blob:"],
+		"media-src": ["'self'", "blob:"],
+		"connect-src": ["'self'"],
+		"worker-src": ["'self'", "blob:"],
+	};
+
 	it("CSP policy equals the meta CSP in src/renderer/index.html", () => {
-		const html = fs.readFileSync(path.join(ROOT, "src/renderer/index.html"), "utf8");
-		const meta = /http-equiv="Content-Security-Policy"\s+content="([^"]+)"/.exec(html)?.[1];
-		expect(meta).toBeDefined();
-		expect(base().app?.security?.csp).toBe(meta);
+		expect(base().app?.security?.csp).toBe(metaCsp("index.html"));
 	});
 
-	it("cannot fetch a remote image for markdown a model wrote", () => {
-		// Explicit, not inherited: without img-src the policy falls back to
-		// default-src, and a later relaxation there would silently re-open this.
-		expect(cspSources("index.html", "img-src")).toEqual(["'self'", "data:", "blob:"]);
-	});
-
-	it("keeps script execution and network calls inside the app", () => {
-		expect(cspSources("index.html", "script-src")).toEqual(["'self'"]);
-		expect(cspSources("index.html", "connect-src")).toEqual(["'self'"]);
+	it("the main page's policy is exactly the pinned one", () => {
+		expect(parseCsp(metaCsp("index.html"))).toEqual(EXPECTED_CSP);
+		expect(parseCsp(base().app?.security?.csp ?? "")).toEqual(EXPECTED_CSP);
 	});
 
 	it("the quick-entry page ships the same content security policy", () => {
-		for (const directive of ["default-src", "script-src", "style-src", "img-src", "connect-src"]) {
-			expect(cspSources("quick-entry.html", directive), directive).toEqual(cspSources("index.html", directive));
-		}
-		const csp = (page: string) =>
-			/http-equiv="Content-Security-Policy"\s+content="([^"]+)"/.exec(
-				fs.readFileSync(path.join(ROOT, "src/renderer", page), "utf8"),
-			)?.[1];
-		expect(csp("index.html")).toBeDefined();
-		expect(csp("quick-entry.html")).toBe(csp("index.html"));
+		expect(parseCsp(metaCsp("quick-entry.html"))).toEqual(EXPECTED_CSP);
+		expect(metaCsp("quick-entry.html")).toBe(metaCsp("index.html"));
 	});
 
 	it("only style-src skips asset CSP modification", () => {
@@ -303,6 +305,22 @@ describe("renderer security", () => {
 		}
 	});
 
+	it("the crate enables no feature by default, so a bundle never carries the test hooks", () => {
+		const cargo = fs.readFileSync(path.join(TAURI, "Cargo.toml"), "utf8");
+		const features = /^\[features\]\n([\s\S]*?)(?=^\[|(?![\s\S]))/m.exec(cargo)?.[1];
+		expect(features, "Cargo.toml has a [features] table").toBeDefined();
+		const list = /^default\s*=\s*\[([^\]]*)\]/m.exec(features ?? "")?.[1];
+		expect(list, "[features] declares default").toBeDefined();
+		const entries = (list ?? "")
+			.split("\n")
+			.map(line => line.replace(/#.*/, ""))
+			.join("")
+			.split(",")
+			.map(entry => entry.trim())
+			.filter(Boolean);
+		expect(entries).toEqual([]);
+	});
+
 	it("no package or release script sets SAI_ATLAS_UPDATE_BASE", () => {
 		for (const [name, script] of Object.entries(scripts()))
 			expect(script, name).not.toContain("SAI_ATLAS_UPDATE_BASE");
@@ -310,9 +328,32 @@ describe("renderer security", () => {
 			...packagingFiles(),
 			path.join(ROOT, "scripts/release-feeds.ts"),
 			path.join(ROOT, "scripts/stage-tauri-sidecar.ts"),
+			path.join(ROOT, "scripts/tauri-linux-build/Dockerfile"),
 			path.join(ROOT, ".github/workflows/ci.yml"),
 		]) {
 			expect(fs.readFileSync(file, "utf8"), path.relative(ROOT, file)).not.toContain("SAI_ATLAS_UPDATE_BASE");
+		}
+	});
+
+	it("the Docker package build only forwards a SAI_ATLAS_UPDATE_BASE the caller exported, and the release steps keep it unset", () => {
+		// `-e NAME` with no value copies the caller's variable into the container and sets nothing
+		// when it is unset, so the release build reads this repository's feed unless someone exported
+		// an override; the release instructions are what keep it unset.
+		const code = fs
+			.readFileSync(path.join(ROOT, "scripts/tauri-linux-build.sh"), "utf8")
+			.split("\n")
+			.filter(line => !line.trimStart().startsWith("#"));
+		expect(code.filter(line => line.includes("SAI_ATLAS_UPDATE_BASE"))).toEqual([
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: a bash parameter expansion, matched literally
+			"[[ -n ${SAI_ATLAS_UPDATE_BASE-} ]] && env_args+=(-e SAI_ATLAS_UPDATE_BASE)",
+		]);
+		const docs: Record<string, string> = {
+			"README.md": "run `bun run package:linux` with `SAI_ATLAS_UPDATE_BASE` unset",
+			"README.vi.md": "chạy `bun run package:linux` khi chưa đặt `SAI_ATLAS_UPDATE_BASE`",
+			"AGENTS.md": "build with `bun run package:linux` and `SAI_ATLAS_UPDATE_BASE` unset",
+		};
+		for (const [file, step] of Object.entries(docs)) {
+			expect(fs.readFileSync(path.join(ROOT, file), "utf8"), file).toContain(step);
 		}
 	});
 });
@@ -426,65 +467,7 @@ describe("Linux package", () => {
 		expect(scripts()["package:tauri:linux"]).toMatch(
 			/ && bun src-tauri\/linux\/finalize-deb\.ts src-tauri\/target\/x86_64-unknown-linux-gnu\/release\/bundle\/deb( && |$)/,
 		);
-		// Round-trip a package laid out the way tauri-bundler writes one.
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "finalize-deb-"));
-		try {
-			const root = path.join(dir, "root");
-			const put = (file: string, contents: string, mode = 0o644) => {
-				fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
-				fs.writeFileSync(path.join(root, file), contents);
-				fs.chmodSync(path.join(root, file), mode);
-			};
-			put(
-				"DEBIAN/control",
-				[
-					"Package: sai-atlas",
-					"Version: 1.0.0",
-					"Architecture: amd64",
-					"Maintainer: test",
-					`Depends: ${DEB_DEPENDS.replace(TRAY_ALTERNATION, TRAY_DEPENDENCY).replace(WEBKIT_REQUIREMENT, WEBKIT_DEPENDENCY)}`,
-					`Recommends: ${DEB_RECOMMENDS}`,
-					"Description: test",
-					"",
-				].join("\n"),
-			);
-			put("usr/bin/sai-atlas", "binary", 0o755);
-			put("usr/lib/Sai ATLAS/omp", "sidecar", 0o755);
-			put("usr/share/applications/Sai ATLAS.desktop", "[Desktop Entry]\nStartupWMClass=vn.io.vif.saiatlas\n");
-			for (const sub of [
-				"DEBIAN",
-				"usr",
-				"usr/bin",
-				"usr/lib",
-				"usr/lib/Sai ATLAS",
-				"usr/share",
-				"usr/share/applications",
-			]) {
-				fs.chmodSync(path.join(root, sub), 0o755);
-			}
-			const deb = path.join(dir, "Sai ATLAS_1.0.0_amd64.deb");
-			expect(spawnSync("dpkg-deb", ["--root-owner-group", "-Zgzip", "-b", root, deb]).status).toBe(0);
-			finalizeDeb(deb);
-			const listing = spawnSync("dpkg-deb", ["-c", deb], { encoding: "utf8" }).stdout.split("\n");
-			const desktopFiles = listing.filter(line => /applications\/[^/]+$/.test(line));
-			expect(desktopFiles).toHaveLength(1);
-			expect(desktopFiles[0]).toMatch(/usr\/share\/applications\/vn\.io\.vif\.saiatlas\.desktop$/);
-			const link = listing.filter(line => line.endsWith("opt/Sai ATLAS/sai-atlas -> /usr/bin/sai-atlas"));
-			expect(link).toHaveLength(1);
-			expect(link[0]).toMatch(/^l.* root\/root /);
-			expect(listing.find(line => line.endsWith("usr/lib/Sai ATLAS/omp"))).toMatch(/^-rwxr-xr-x root\/root /);
-			const extracted = path.join(dir, "check");
-			expect(spawnSync("dpkg-deb", ["-e", deb, extracted]).status).toBe(0);
-			const md5sums = fs.readFileSync(path.join(extracted, "md5sums"), "utf8");
-			expect(md5sums).toContain("  usr/share/applications/vn.io.vif.saiatlas.desktop\n");
-			expect(md5sums).not.toContain("opt/Sai ATLAS/sai-atlas");
-			expect(fs.readFileSync(path.join(extracted, "control"), "utf8")).toContain("Package: sai-atlas");
-			const field = (name: string) => spawnSync("dpkg-deb", ["-f", deb, name], { encoding: "utf8" }).stdout.trim();
-			expect(field("Depends")).toBe(DEB_DEPENDS);
-			expect(field("Recommends")).toBe(DEB_RECOMMENDS);
-		} finally {
-			fs.rmSync(dir, { recursive: true, force: true });
-		}
+		// finalize-deb.test.ts round-trips a package laid out the way tauri-bundler writes one.
 	});
 
 	it("the AppImage is finished last so its bundled WebKit finds the host's bwrap and xdg-dbus-proxy", () => {
@@ -546,6 +529,30 @@ describe("no macOS or Windows build", () => {
 	});
 });
 
+describe("release sidecar checks", () => {
+	it("the sidecar build checks the RPC protocol before it compiles", () => {
+		// The sync's step 5 and the release's sidecar build both run build-bundled-omp.ts, so
+		// this is where a GUI/agent protocol mismatch stops a sync or a release.
+		const source = fs.readFileSync(path.join(ROOT, "scripts/build-bundled-omp.ts"), "utf8");
+		const check = source.indexOf('await runPackageScript(guiRoot, "check:protocol");');
+		expect(check).toBeGreaterThan(-1);
+		expect(check).toBeLessThan(source.indexOf("await compileCodingAgent("));
+		expect(scripts()["check:protocol"]).toBe("bun scripts/check-protocol.ts");
+	});
+
+	it("the release steps run the privacy check on the release sidecar before packaging it", () => {
+		for (const readme of ["README.md", "README.vi.md"]) {
+			const text = fs.readFileSync(path.join(ROOT, readme), "utf8");
+			const build = text.indexOf("`bun run build:omp:linux` ");
+			const check = text.indexOf("`bun scripts/check-assistant-pack.ts resources/omp.linux-x64`");
+			const pack = text.indexOf("`bun run package:linux` ", build);
+			expect(build, readme).toBeGreaterThan(-1);
+			expect(check, readme).toBeGreaterThan(build);
+			expect(pack, readme).toBeGreaterThan(check);
+		}
+	});
+});
+
 describe("Linux CI workflow", () => {
 	const workflows = path.join(ROOT, ".github", "workflows");
 	interface Workflow {
@@ -559,15 +566,22 @@ describe("Linux CI workflow", () => {
 		>;
 	}
 
-	it("type-checks, tests and builds a clean clone on ubuntu-latest", () => {
+	it("type-checks, lints, tests and builds a clean clone on ubuntu-latest", () => {
 		const ci = parseYaml(fs.readFileSync(path.join(workflows, "ci.yml"), "utf8")) as Workflow;
 		const job = ci.jobs?.linux;
 		expect(job?.["runs-on"]).toBe("ubuntu-latest");
 		expect(job?.steps?.flatMap(step => (step.run ? [step.run] : []))).toEqual([
 			"bun install --frozen-lockfile",
 			"bun run check:types",
+			"bunx biome check .",
 			"bunx vitest run",
 			"bun run build",
+		]);
+		// check:types covers the build and release scripts too, with Bun's types.
+		expect(scripts()["check:types"].split(" && ")).toContain("tsc --noEmit -p tsconfig.scripts.json");
+		expect(readJson<{ include: string[] }>("tsconfig.scripts.json").include).toEqual([
+			"scripts/*.ts",
+			"src-tauri/linux/*.ts",
 		]);
 		// Actions are pinned to full commit SHAs, and the checkout token is not left on disk.
 		const uses = job?.steps?.flatMap(step => (step.uses ? [step.uses] : [])) ?? [];
@@ -584,6 +598,49 @@ describe("Linux CI workflow", () => {
 			.readdirSync(workflows)
 			.filter(name => fs.readFileSync(path.join(workflows, name), "utf8").includes("actions/deploy-pages"));
 		expect(publishers).toEqual(["pages.yml"]);
+	});
+});
+
+describe("e2e CI job", () => {
+	interface Job {
+		"runs-on"?: string;
+		"continue-on-error"?: boolean;
+		env?: Record<string, string>;
+		steps?: { run?: string; uses?: string; env?: Record<string, string> }[];
+	}
+
+	it("runs the wdio specs against the e2e-hooks build on a virtual display, without the compiled sidecar", () => {
+		const ci = parseYaml(fs.readFileSync(path.join(ROOT, ".github/workflows/ci.yml"), "utf8")) as {
+			jobs?: Record<string, Job>;
+		};
+		const job = ci.jobs?.["e2e-tauri"];
+		expect(job?.["runs-on"]).toBe("ubuntu-latest");
+		// Non-blocking until the job proves stable on the runners.
+		expect(job?.["continue-on-error"]).toBe(true);
+		expect(job?.env?.CARGO_HOME_BIN).toBe("/home/runner/.cargo/bin");
+		const runs = job?.steps?.flatMap(step => (step.run ? [step.run] : [])) ?? [];
+		// The binary the specs launch (e2e-tauri/session.ts imports wdio, so read its source).
+		const buildCommand = /export const BUILD_COMMAND = "([^"]+)"/.exec(
+			fs.readFileSync(path.join(ROOT, "e2e-tauri/session.ts"), "utf8"),
+		)?.[1];
+		expect(buildCommand).toBeDefined();
+		for (const command of [
+			"bun install --frozen-lockfile",
+			"bun run build:pack",
+			"bun run build:renderer:tauri",
+			buildCommand,
+			"scripts/virtual-display.sh run -- bun run test:e2e",
+			"scripts/virtual-display.sh stop",
+		]) {
+			expect(runs).toContain(command);
+		}
+		// A clean clone has no resources/omp: the specs that launch it stay out.
+		const specs = job?.steps?.find(step => step.run === "scripts/virtual-display.sh run -- bun run test:e2e");
+		expect(specs?.env?.OMP_E2E_NO_SIDECAR).toBe("1");
+		expect(runs.join("\n")).toMatch(/webkit2gtk-driver/);
+		expect(runs.join("\n")).toMatch(/cargo install tauri-driver --locked/);
+		for (const action of job?.steps?.flatMap(step => (step.uses ? [step.uses] : [])) ?? [])
+			expect(action).toMatch(/@[0-9a-f]{40}$/);
 	});
 });
 
@@ -605,12 +662,18 @@ describe("Tauri CI job", () => {
 		for (const command of [
 			"bun install --frozen-lockfile",
 			"bun run build:renderer:tauri",
+			// Both feature sets: all features compile the e2e hooks in, the default set is what ships.
 			"cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
-			"cargo test --manifest-path src-tauri/Cargo.toml --all-features",
+			"cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+			// --no-fail-fast, so a failing lib test still lets the integration targets run.
+			"cargo test --manifest-path src-tauri/Cargo.toml --all-features --no-fail-fast",
+			"cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast",
 			"bash scripts/check-module.sh snapshots",
 		]) {
 			expect(runs).toContain(command);
 		}
+		for (const command of runs.filter(run => run.startsWith("cargo test")))
+			expect(command).toContain("--no-fail-fast");
 		expect(runs.join("\n")).not.toContain("check-test-parity");
 		// Diff-based ownership gates need a merge base and fail by design once the
 		// cross-module work lands on main, so CI runs only whole-tree checks.

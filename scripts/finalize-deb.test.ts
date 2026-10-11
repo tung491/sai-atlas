@@ -149,8 +149,17 @@ describe("finalizeDeb control checks", () => {
 		put("DEBIAN/control", controlText);
 		for (const [name, contents] of Object.entries(members)) put(`DEBIAN/${name}`, contents, 0o755);
 		put("usr/bin/sai-atlas", "binary", 0o755);
+		put("usr/lib/Sai ATLAS/omp", "sidecar", 0o755);
 		put("usr/share/applications/Sai ATLAS.desktop", "[Desktop Entry]\n");
-		for (const sub of ["DEBIAN", "usr", "usr/bin", "usr/share", "usr/share/applications"]) {
+		for (const sub of [
+			"DEBIAN",
+			"usr",
+			"usr/bin",
+			"usr/lib",
+			"usr/lib/Sai ATLAS",
+			"usr/share",
+			"usr/share/applications",
+		]) {
 			chmodSync(path.join(root, sub), 0o755);
 		}
 		const deb = path.join(dir, "Sai ATLAS_1.0.0_amd64.deb");
@@ -163,13 +172,26 @@ describe("finalizeDeb control checks", () => {
 	const field = (deb: string, name: string) =>
 		spawnSync("dpkg-deb", ["-f", deb, name], { encoding: "utf8" }).stdout.trim();
 
-	it("ships the alternation, the four Recommends and no Pre-Depends", () => {
+	it("ships the alternation, the four Recommends, no Pre-Depends, the app-id desktop entry and the /opt compat symlink", () => {
 		const deb = bundlerDeb(control());
 		finalizeDeb(deb);
 		expect(field(deb, "Depends")).toBe(DEB_DEPENDS);
 		expect(field(deb, "Recommends")).toBe(DEB_RECOMMENDS);
 		expect(field(deb, "Pre-Depends")).toBe("");
 		expect(readdirSync(path.dirname(deb))).toEqual([path.basename(deb)]);
+		const listing = spawnSync("dpkg-deb", ["-c", deb], { encoding: "utf8" }).stdout.split("\n");
+		const desktopFiles = listing.filter(line => /applications\/[^/]+$/.test(line));
+		expect(desktopFiles).toHaveLength(1);
+		expect(desktopFiles[0]).toMatch(/usr\/share\/applications\/vn\.io\.vif\.saiatlas\.desktop$/);
+		const link = listing.filter(line => line.endsWith("opt/Sai ATLAS/sai-atlas -> /usr/bin/sai-atlas"));
+		expect(link).toHaveLength(1);
+		expect(link[0]).toMatch(/^l.* root\/root /);
+		expect(listing.find(line => line.endsWith("usr/lib/Sai ATLAS/omp"))).toMatch(/^-rwxr-xr-x root\/root /);
+		const extracted = path.join(path.dirname(deb), "check");
+		expect(spawnSync("dpkg-deb", ["-e", deb, extracted]).status).toBe(0);
+		const md5sums = readFileSync(path.join(extracted, "md5sums"), "utf8");
+		expect(md5sums).toContain("  usr/share/applications/vn.io.vif.saiatlas.desktop\n");
+		expect(md5sums).not.toContain("opt/Sai ATLAS/sai-atlas");
 	});
 
 	it("leaves the bundler's package untouched when the finished one would carry a maintainer script", () => {

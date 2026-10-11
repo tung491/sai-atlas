@@ -22,14 +22,16 @@ jobs:
           bun-version: "1.4.2"
       - run: bun install --frozen-lockfile
       - run: bun run check:types
-      # A clean clone has no sidecar binary; the assistant-pack job covers the pack itself.
+      - run: bunx biome check .
+      # A clean clone has no sidecar binary, so the compiled-sidecar cases are skipped.
       - run: bunx vitest run
         env:
           SKIP_COMPILED: "1"
       - run: bun run build
 
-  # The assistant pack: its unit tests, the build script, and every office file it makes
-  # opened in LibreOffice. The compiled-sidecar cases need a local sidecar and stay local.
+  # The assistant pack: the build script, and every office file it makes opened in
+  # LibreOffice. Its unit tests run in the linux job's vitest run; the compiled-sidecar
+  # cases need a local sidecar and stay local.
   assistant-pack:
     runs-on: ubuntu-latest
     steps:
@@ -45,14 +47,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libreoffice-writer libreoffice-calc libreoffice-impress
       - run: bun run build:pack
-      - run: bunx vitest run assistant-pack scripts/build-assistant-pack.test.ts
-        env:
-          SKIP_COMPILED: "1"
       - run: bunx vitest run assistant-pack/test/visual.test.ts
         env:
           CI_VISUAL: "1"
 
-  # The Tauri core: clippy, the Rust tests and the frozen API snapshots (checked
+  # The Tauri core: clippy and the Rust tests, with all features (the e2e hooks) and
+  # with the default features a bundle ships, and the frozen API snapshots (checked
   # with the pinned cargo-public-api). Every check here covers the whole tree, so
   # it holds on main and on any branch. No sidecar is needed: the bundle configs
   # that name it are passed only to package builds.
@@ -102,6 +102,81 @@ jobs:
       - run: bun run build:pack
       - run: bun run build:renderer:tauri
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --all-features
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      # --no-fail-fast: a failing lib test must not hide the integration targets' results.
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --all-features --no-fail-fast
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast
       - name: Public API snapshots
         run: bash scripts/check-module.sh snapshots
+
+  # The wdio e2e specs (e2e-tauri/*.e2e.ts) against the e2e-hooks debug build and
+  # the scripted sidecar (e2e/sidecar-fixture.ts), under Xvfb with a private
+  # session bus (scripts/virtual-display.sh). real-core and deep-audit run the
+  # compiled sidecar, which a clean clone cannot build (OMP_E2E_NO_SIDECAR leaves
+  # them out), and the packaged smoke needs an installed .deb, so those stay
+  # local. Non-blocking until the job proves stable.
+  e2e-tauri:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      # wdio.conf.ts finds tauri-driver here (scripts/rust-pins.env).
+      CARGO_HOME_BIN: /home/runner/.cargo/bin
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.2"
+      - name: Install the WebKitGTK build and sandbox packages, WebKitWebDriver and Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev librsvg2-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev build-essential gstreamer1.0-pipewire gstreamer1.0-plugins-good bubblewrap xdg-dbus-proxy webkit2gtk-driver xvfb
+      # WebKit's web-process sandbox (bubblewrap) needs unprivileged user
+      # namespaces, which the runner's AppArmor policy restricts.
+      - name: Allow the WebKit sandbox's user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/bin/tauri-driver
+            src-tauri/target
+          key: e2e-tauri-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/rust-toolchain.toml', 'scripts/rust-pins.env') }}
+          restore-keys: e2e-tauri-
+      - name: Install the Rust toolchain, tauri-cli and tauri-driver
+        run: |
+          channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' src-tauri/rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+          rustup default "$channel"
+          if ! cargo tauri --version 2>/dev/null | grep -q '^tauri-cli 2\.'; then
+            cargo install tauri-cli --version "^2" --locked --force
+          fi
+          if [ ! -x "$CARGO_HOME_BIN/tauri-driver" ]; then
+            cargo install tauri-driver --locked
+          fi
+      - run: bun install --frozen-lockfile
+      - run: bun run build:pack
+      - run: bun run build:renderer:tauri
+      # e2e-tauri/session.ts BUILD_COMMAND: the binary the specs launch.
+      - run: cargo tauri build --debug --features e2e-hooks --no-bundle
+      - name: wdio e2e specs
+        run: scripts/virtual-display.sh run -- bun run test:e2e
+        env:
+          OMP_E2E_NO_SIDECAR: "1"
+      - name: Stop the virtual display
+        if: always()
+        run: scripts/virtual-display.sh stop
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-tauri-test-results
+          path: test-results/
+          if-no-files-found: ignore
