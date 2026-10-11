@@ -4,12 +4,12 @@
 
 **Trợ lý AI riêng tư cho công việc hằng ngày trên SAI OS.**
 
-<a href="https://github.com/tung491/oh-my-pi-gui/releases"><img src="https://img.shields.io/github/v/release/tung491/oh-my-pi-gui?style=flat&colorA=222222&colorB=3FB950" alt="Bản phát hành"></a>
-<a href="https://github.com/tung491/oh-my-pi-gui/releases"><img src="https://img.shields.io/github/downloads/tung491/oh-my-pi-gui/total?style=flat&colorA=222222&colorB=58A6FF" alt="Lượt tải"></a>
-<a href="./LICENSE"><img src="https://img.shields.io/github/license/tung491/oh-my-pi-gui?style=flat&colorA=222222&colorB=BE185D" alt="Giấy phép"></a>
+<a href="https://github.com/tung491/sai-atlas/releases"><img src="https://img.shields.io/github/v/release/tung491/sai-atlas?style=flat&colorA=222222&colorB=3FB950" alt="Bản phát hành"></a>
+<a href="https://github.com/tung491/sai-atlas/releases"><img src="https://img.shields.io/github/downloads/tung491/sai-atlas/total?style=flat&colorA=222222&colorB=58A6FF" alt="Lượt tải"></a>
+<a href="./LICENSE"><img src="https://img.shields.io/github/license/tung491/sai-atlas?style=flat&colorA=222222&colorB=BE185D" alt="Giấy phép"></a>
 <img src="https://img.shields.io/badge/platform-Linux-222222?style=flat" alt="Nền tảng: Linux">
 
-[English](./README.md) · Tiếng Việt · [Bản phát hành](https://github.com/tung491/oh-my-pi-gui/releases)
+[English](./README.md) · Tiếng Việt · [Bản phát hành](https://github.com/tung491/sai-atlas/releases)
 
 </div>
 
@@ -39,12 +39,12 @@ Sai ATLAS là trợ lý AI giúp bạn làm những việc văn phòng thường
 <a id="vi-install"></a>
 ## Cài đặt và bắt đầu
 
-**Bản cài đặt được mô tả ở đây: [v0.9.16](https://github.com/tung491/oh-my-pi-gui/releases/tag/v0.9.16).** Xem [Bản phát hành](https://github.com/tung491/oh-my-pi-gui/releases) để có bản tải và ghi chú phát hành mới nhất.
+**Bản cài đặt được mô tả ở đây: [v0.9.16](https://github.com/tung491/sai-atlas/releases/tag/v0.9.16).** Xem [Bản phát hành](https://github.com/tung491/sai-atlas/releases) để có bản tải và ghi chú phát hành mới nhất.
 
 | Linux x64 (Ubuntu 24.04+) | Gói cài đặt |
 |---|---|
-| Gói Debian (khuyên dùng) | `sai-atlas_<version>_amd64.deb` trong [Bản phát hành](https://github.com/tung491/oh-my-pi-gui/releases) |
-| AppImage | `Sai-ATLAS-<version>-x86_64.AppImage` trong [Bản phát hành](https://github.com/tung491/oh-my-pi-gui/releases) |
+| Gói Debian (khuyên dùng) | `sai-atlas_<version>_amd64.deb` trong [Bản phát hành](https://github.com/tung491/sai-atlas/releases) |
+| AppImage | `Sai-ATLAS-<version>-x86_64.AppImage` trong [Bản phát hành](https://github.com/tung491/sai-atlas/releases) |
 
 Trên Linux, Sai ATLAS cần Ubuntu 24.04 trở lên (glibc 2.39). Lệnh `sudo apt install ./sai-atlas_<version>_amd64.deb` cài trình khởi chạy `sai-atlas` tại `/usr/bin/sai-atlas` (công cụ dòng lệnh của agent vẫn tên là `omp`), agent đi kèm tại `/usr/lib/Sai ATLAS/omp` (không nằm trong `PATH`), trình xử lý liên kết `omp://`, và một liên kết tương thích tại `/opt/Sai ATLAS/sai-atlas`, đường dẫn mà các phiên bản cũ khởi động. Gói phụ thuộc vào `bubblewrap` và `xdg-dbus-proxy`, hai gói chạy hộp cát (sandbox) của WebKit; hộp cát luôn bật và không cần hồ sơ AppArmor nào. Việc đăng ký `omp://` dùng `desktop-file-utils` và `xdg-utils`, được `apt install` cài thêm như gói khuyến nghị còn `dpkg -i` thì bỏ qua. Mở ứng dụng từ lưới ứng dụng hoặc bằng `sai-atlas /đường/dẫn/thư/mục`. Chưa bản phát hành nào có gói Linux dưới tên cũ, nhưng nếu bạn đã tự dựng và cài gói `omp` từ mã nguồn, hãy gỡ nó trước bằng `sudo apt remove omp`.
 
@@ -135,7 +135,7 @@ omp-monorepo/                    # nornzach/oh-my-pi: bản fork và nguồn d�
 ├── .git/
 ├── packages/coding-agent/
 ├── packages/natives/
-└── packages/gui/                # tung491/oh-my-pi-gui: kho mã của sản phẩm này
+└── packages/gui/                # tung491/sai-atlas: kho mã của sản phẩm này
     ├── .git/
     ├── src/
     └── resources/omp*           # bị bỏ qua, sidecar dựng tại máy
@@ -143,7 +143,7 @@ omp-monorepo/                    # nornzach/oh-my-pi: bản fork và nguồn d�
 
 | Kho mã | Trách nhiệm |
 |---|---|
-| [`tung491/oh-my-pi-gui`](https://github.com/tung491/oh-my-pi-gui) | Mã GUI, commit, tag và bản phát hành. Công việc trên GUI được đẩy lên `origin/main` của kho này. |
+| [`tung491/sai-atlas`](https://github.com/tung491/sai-atlas) | Mã GUI, commit, tag và bản phát hành. Công việc trên GUI được đẩy lên `origin/main` của kho này. |
 | [`nornzach/oh-my-pi`](https://github.com/nornzach/oh-my-pi) | Bản fork monorepo bao ngoài: mã nguồn agent, đồng bộ upstream và dựng sidecar. Thay đổi của agent được commit ở đây và đẩy lên `origin` của nó. |
 | [`can1357/oh-my-pi`](https://github.com/can1357/oh-my-pi) | Nguồn tính năng upstream, lấy về qua remote `upstream` của monorepo. **Không bao giờ đẩy lên đây.** |
 
@@ -159,7 +159,7 @@ git clone https://github.com/nornzach/oh-my-pi.git omp-monorepo
 cd omp-monorepo
 git remote add upstream https://github.com/can1357/oh-my-pi.git
 bun install
-git clone https://github.com/tung491/oh-my-pi-gui.git packages/gui
+git clone https://github.com/tung491/sai-atlas.git packages/gui
 cd packages/gui
 bun install
 ```
@@ -227,7 +227,7 @@ Biến môi trường tùy chọn: `SHOWCASE_THEME=light` chụp với giao di�
 <details>
 <summary><b>Đồng bộ, dựng các gói Linux, chạy thử, rồi phát hành</b></summary>
 
-Bản phát hành chỉ thuộc về [`tung491/oh-my-pi-gui`](https://github.com/tung491/oh-my-pi-gui/releases). Luôn giữ ranh giới giữa hai kho mã:
+Bản phát hành chỉ thuộc về [`tung491/sai-atlas`](https://github.com/tung491/sai-atlas/releases). Luôn giữ ranh giới giữa hai kho mã:
 
 1. **Bắt đầu với các bản checkout sạch và đồng bộ upstream.** Từ **thư mục gốc monorepo**, chạy `bash packages/gui/scripts/sync-upstream.sh`. Script lấy về và merge `upstream/main`, cài dependency, tạo tài nguyên thống kê, dựng lại và chạy thử sidecar, rồi dựng, kiểm tra và kiểm thử GUI. Nếu có xung đột, hãy giải quyết và commit lần merge của monorepo, rồi chạy `SKIP_MERGE=1 bash packages/gui/scripts/sync-upstream.sh`. Không tự merge thay cho script. Xem lại và commit các thay đổi còn lại của monorepo ở đó; chỉ đẩy chúng lên `origin` của bản fork.
 2. **Chuẩn bị bản phát hành GUI.** Trong `packages/gui/`, nâng `package.json` và `src-tauri/Cargo.toml` lên cùng một phiên bản (một bài kiểm thử đóng gói báo lỗi khi chúng khác nhau), viết mục `CHANGELOG.md` của bản phát hành, và cập nhật liên kết cài đặt cùng ghi chú phát hành trong cả `README.md` lẫn `README.vi.md`.

@@ -13,7 +13,7 @@ use crate::i18n::{MainI18n, MainTextKey};
 use crate::runtime_log;
 
 const MENU_ACTION_CHANNEL: &str = "menu:action";
-pub(crate) const DOCUMENTATION_URL: &str = "https://github.com/tung491/oh-my-pi-gui";
+pub(crate) const DOCUMENTATION_URL: &str = "https://github.com/tung491/sai-atlas";
 
 /// Menu ids: `menu:action:<renderer action>` for actions the renderer handles, and a few the shell owns.
 const ACTION_PREFIX: &str = "menu:action:";

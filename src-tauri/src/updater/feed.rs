@@ -11,7 +11,7 @@ use super::state::{release_file_name, ReleaseFile};
 
 /// The publishing repository's releases page. A build-time override lets a
 /// test bundle read a local feed; shipped builds have no runtime switch.
-const GITHUB_RELEASE_BASE: &str = "https://github.com/tung491/oh-my-pi-gui/releases";
+const GITHUB_RELEASE_BASE: &str = "https://github.com/tung491/sai-atlas/releases";
 
 pub(crate) fn release_base() -> &'static str {
     option_env!("SAI_ATLAS_UPDATE_BASE").unwrap_or(GITHUB_RELEASE_BASE)
@@ -203,7 +203,7 @@ releaseDate: '2026-09-30T10:00:00.000Z'
 
     #[test]
     fn builds_the_feed_and_download_urls_from_one_base() {
-        let base = "https://github.com/tung491/oh-my-pi-gui/releases";
+        let base = "https://github.com/tung491/sai-atlas/releases";
         assert_eq!(feed_url(base), format!("{base}/latest/download/{FEED_FILE}"));
         assert_eq!(feed_url(&format!("{base}/")), format!("{base}/latest/download/{FEED_FILE}"));
         assert_eq!(download_url(base, "0.9.16", "sai-atlas_0.9.16_amd64.deb"), format!("{base}/download/v0.9.16/sai-atlas_0.9.16_amd64.deb"));

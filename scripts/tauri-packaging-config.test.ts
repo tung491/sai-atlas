@@ -332,7 +332,7 @@ describe("Linux package", () => {
 		};
 		const description = readJson<{ description: string }>("package.json").description;
 		expect(bundle?.publisher).toBe("Tung Son Do <dosontung007@gmail.com>");
-		expect(bundle?.homepage).toBe("https://github.com/tung491/oh-my-pi-gui");
+		expect(bundle?.homepage).toBe("https://github.com/tung491/sai-atlas");
 		expect(bundle?.shortDescription).toBe(description);
 		expect(bundle?.longDescription).toBe(description);
 	});

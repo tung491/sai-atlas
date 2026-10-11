@@ -4,12 +4,12 @@
 
 **The private AI assistant for everyday work on SAI OS.**
 
-<a href="https://github.com/tung491/oh-my-pi-gui/releases"><img src="https://img.shields.io/github/v/release/tung491/oh-my-pi-gui?style=flat&colorA=222222&colorB=3FB950" alt="Release"></a>
-<a href="https://github.com/tung491/oh-my-pi-gui/releases"><img src="https://img.shields.io/github/downloads/tung491/oh-my-pi-gui/total?style=flat&colorA=222222&colorB=58A6FF" alt="Downloads"></a>
-<a href="./LICENSE"><img src="https://img.shields.io/github/license/tung491/oh-my-pi-gui?style=flat&colorA=222222&colorB=BE185D" alt="License"></a>
+<a href="https://github.com/tung491/sai-atlas/releases"><img src="https://img.shields.io/github/v/release/tung491/sai-atlas?style=flat&colorA=222222&colorB=3FB950" alt="Release"></a>
+<a href="https://github.com/tung491/sai-atlas/releases"><img src="https://img.shields.io/github/downloads/tung491/sai-atlas/total?style=flat&colorA=222222&colorB=58A6FF" alt="Downloads"></a>
+<a href="./LICENSE"><img src="https://img.shields.io/github/license/tung491/sai-atlas?style=flat&colorA=222222&colorB=BE185D" alt="License"></a>
 <img src="https://img.shields.io/badge/platform-Linux-222222?style=flat" alt="Platform: Linux">
 
-English · [Tiếng Việt](./README.vi.md) · [Releases](https://github.com/tung491/oh-my-pi-gui/releases)
+English · [Tiếng Việt](./README.vi.md) · [Releases](https://github.com/tung491/sai-atlas/releases)
 
 </div>
 
@@ -39,12 +39,12 @@ The screenshots show the real app with a scripted demonstration conversation; no
 <a id="en-install"></a>
 ## Install & start
 
-**Documented install baseline: [v0.9.16](https://github.com/tung491/oh-my-pi-gui/releases/tag/v0.9.16).** Check [Releases](https://github.com/tung491/oh-my-pi-gui/releases) for authoritative current downloads and release notes.
+**Documented install baseline: [v0.9.16](https://github.com/tung491/sai-atlas/releases/tag/v0.9.16).** Check [Releases](https://github.com/tung491/sai-atlas/releases) for authoritative current downloads and release notes.
 
 | Linux x64 (Ubuntu 24.04+) | Package |
 |---|---|
-| Debian package (recommended) | `sai-atlas_<version>_amd64.deb` from [Releases](https://github.com/tung491/oh-my-pi-gui/releases) |
-| AppImage | `Sai-ATLAS-<version>-x86_64.AppImage` from [Releases](https://github.com/tung491/oh-my-pi-gui/releases) |
+| Debian package (recommended) | `sai-atlas_<version>_amd64.deb` from [Releases](https://github.com/tung491/sai-atlas/releases) |
+| AppImage | `Sai-ATLAS-<version>-x86_64.AppImage` from [Releases](https://github.com/tung491/sai-atlas/releases) |
 
 On Linux, Sai ATLAS needs Ubuntu 24.04 or later (glibc 2.39). `sudo apt install ./sai-atlas_<version>_amd64.deb` installs the `sai-atlas` launcher at `/usr/bin/sai-atlas` (the agent CLI keeps the name `omp`), the bundled agent at `/usr/lib/Sai ATLAS/omp` (off `PATH`), the `omp://` link handler, and a compatibility link at `/opt/Sai ATLAS/sai-atlas`, the path older versions started from. The package depends on `bubblewrap` and `xdg-dbus-proxy`, which run the WebKit sandbox; the sandbox is always on, and no AppArmor profile is shipped or needed. Registering `omp://` uses `desktop-file-utils` and `xdg-utils`, which `apt install` adds as recommended packages and `dpkg -i` skips. Start it from the app grid or with `sai-atlas /abs/project/dir`. No release has shipped a Linux package under the old name, but if you built and installed the `omp` package from source, remove it first with `sudo apt remove omp`.
 
@@ -135,7 +135,7 @@ omp-monorepo/                    # nornzach/oh-my-pi: fork and sidecar build sou
 ├── .git/
 ├── packages/coding-agent/
 ├── packages/natives/
-└── packages/gui/                # tung491/oh-my-pi-gui: this product repository
+└── packages/gui/                # tung491/sai-atlas: this product repository
     ├── .git/
     ├── src/
     └── resources/omp*           # ignored, locally built sidecars
@@ -143,7 +143,7 @@ omp-monorepo/                    # nornzach/oh-my-pi: fork and sidecar build sou
 
 | Repository | Responsibility |
 |---|---|
-| [`tung491/oh-my-pi-gui`](https://github.com/tung491/oh-my-pi-gui) | GUI code, commits, tags, and releases. GUI work goes to this repository's `origin/main`. |
+| [`tung491/sai-atlas`](https://github.com/tung491/sai-atlas) | GUI code, commits, tags, and releases. GUI work goes to this repository's `origin/main`. |
 | [`nornzach/oh-my-pi`](https://github.com/nornzach/oh-my-pi) | Enclosing monorepo fork: agent source, upstream sync, and sidecar builds. Agent changes are committed here and pushed to its `origin`. |
 | [`can1357/oh-my-pi`](https://github.com/can1357/oh-my-pi) | Upstream feature source, fetched through the monorepo's `upstream` remote. **Never push here.** |
 
@@ -159,7 +159,7 @@ git clone https://github.com/nornzach/oh-my-pi.git omp-monorepo
 cd omp-monorepo
 git remote add upstream https://github.com/can1357/oh-my-pi.git
 bun install
-git clone https://github.com/tung491/oh-my-pi-gui.git packages/gui
+git clone https://github.com/tung491/sai-atlas.git packages/gui
 cd packages/gui
 bun install
 ```
@@ -227,7 +227,7 @@ Optional environment variables: `SHOWCASE_THEME=light` captures the VIF Light th
 <details>
 <summary><b>Sync, build the Linux packages, smoke-test them, then publish</b></summary>
 
-Releases belong only to [`tung491/oh-my-pi-gui`](https://github.com/tung491/oh-my-pi-gui/releases). Preserve the two-repository boundary throughout:
+Releases belong only to [`tung491/sai-atlas`](https://github.com/tung491/sai-atlas/releases). Preserve the two-repository boundary throughout:
 
 1. **Start with clean checkouts and sync upstream.** From the **monorepo root**, run `bash packages/gui/scripts/sync-upstream.sh`. It fetches/merges `upstream/main`, installs dependencies, generates the statistics assets, rebuilds/smoke-tests the sidecar, and builds/checks/tests the GUI. If there are conflicts, resolve and commit the monorepo merge, then run `SKIP_MERGE=1 bash packages/gui/scripts/sync-upstream.sh`. Do not substitute a hand-rolled merge. Review and commit any remaining monorepo changes there; push them only to the fork's `origin`.
 2. **Prepare the GUI release.** In `packages/gui/`, bump `package.json` and `src-tauri/Cargo.toml` to the same version (a packaging test fails when they differ), write the release's `CHANGELOG.md` entry, and update the install links and release notes in both `README.md` and `README.vi.md`.
