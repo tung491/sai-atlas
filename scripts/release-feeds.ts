@@ -15,6 +15,7 @@ import { copyFileSync, createReadStream, existsSync, mkdirSync, readdirSync, sta
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Scalar, stringify } from "yaml";
+import { PRODUCT_NAME } from "../src/shared/product";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -54,7 +55,7 @@ async function feedFile(outDir: string, name: string): Promise<FeedFile> {
 	return { url: name, sha512: await sha512Base64(file), size: statSync(file).size };
 }
 
-/** The one file in `dir` with `extension` whose name carries `version`; anything else is an error. */
+/** The one file in `dir` with `extension`, which must be this version's Tauri bundle; anything else is an error. */
 function onlyBundle(dir: string, extension: string, version: string): string {
 	if (!existsSync(dir)) throw new Error(`${dir} does not exist`);
 	const matches = readdirSync(dir).filter(name => name.endsWith(extension));
@@ -62,10 +63,11 @@ function onlyBundle(dir: string, extension: string, version: string): string {
 		throw new Error(`expected exactly one ${extension} in ${dir}, found ${matches.length}: ${matches.join(", ")}`);
 	}
 	const name = matches[0] as string;
-	// Tauri names bundles `<productName>_<version>_<arch>`; a stale bundle from another version must not ship.
-	if (!name.includes(`_${version}_`) && !name.includes(`-${version}`)) {
-		throw new Error(`${path.join(dir, name)} is not a ${version} bundle`);
-	}
+	// tauri-bundler names both x86_64 bundles `<productName>_<version>_amd64`. The whole
+	// name must match: a stale bundle from another version, or a prerelease whose
+	// version merely starts with this one, must not ship.
+	const expected = `${PRODUCT_NAME}_${version}_amd64${extension}`;
+	if (name !== expected) throw new Error(`${path.join(dir, name)} is not the ${version} bundle ${expected}`);
 	return path.join(dir, name);
 }
 

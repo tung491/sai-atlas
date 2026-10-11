@@ -1,8 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	APPIMAGETOOL,
+	appimagetool,
 	assertMediaFramework,
 	BUNDLED_GSTREAMER_PLUGINS,
 	GSTREAMER_PLUGIN_DIR,
@@ -146,5 +148,41 @@ describe("assertMediaFramework", () => {
 			file(dir, library);
 			expect(() => assertMediaFramework(dir)).toThrow(library);
 		}
+	});
+});
+
+describe("appimagetool", () => {
+	const dirs: string[] = [];
+	afterEach(() => {
+		for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+	});
+
+	function cacheDir(): string {
+		const dir = mkdtempSync(path.join(os.tmpdir(), "appimagetool-cache-"));
+		dirs.push(dir);
+		return path.join(dir, "tauri");
+	}
+
+	it("refuses a download whose sha256 differs from the pin and caches nothing", async () => {
+		const cache = cacheDir();
+		const urls: string[] = [];
+		const fetch = async (url: string) => {
+			urls.push(url);
+			return new Response("not the pinned appimagetool");
+		};
+		await expect(appimagetool({ cacheDir: cache, fetch })).rejects.toThrow(`${APPIMAGETOOL.url} has sha256 `);
+		expect(urls).toEqual([APPIMAGETOOL.url]);
+		expect(existsSync(cache) ? readdirSync(cache) : []).toEqual([]);
+	});
+
+	it("refuses a cached tool whose sha256 differs from the pin, without downloading", async () => {
+		const cache = cacheDir();
+		mkdirSync(cache, { recursive: true });
+		const cached = path.join(cache, `appimagetool-${APPIMAGETOOL.version}-x86_64.AppImage`);
+		writeFileSync(cached, "a tampered appimagetool");
+		const fetch = async (url: string): Promise<Response> => {
+			throw new Error(`unexpected download of ${url}`);
+		};
+		await expect(appimagetool({ cacheDir: cache, fetch })).rejects.toThrow(`${cached} has sha256 `);
 	});
 });

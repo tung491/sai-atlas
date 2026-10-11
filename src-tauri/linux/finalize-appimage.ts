@@ -196,9 +196,17 @@ function toolsDir(): string {
 	return path.join(cache, "tauri");
 }
 
+/** Where the pinned appimagetool is cached and how it is downloaded. */
+export interface ToolSource {
+	cacheDir: string;
+	fetch: (url: string) => Promise<Response>;
+}
+
 /** The pinned appimagetool, downloaded on first use and verified on every use. */
-async function appimagetool(): Promise<string> {
-	const dir = toolsDir();
+export async function appimagetool({
+	cacheDir: dir = toolsDir(),
+	fetch: download = url => fetch(url),
+}: Partial<ToolSource> = {}): Promise<string> {
 	const tool = path.join(dir, `appimagetool-${APPIMAGETOOL.version}-x86_64.AppImage`);
 	if (existsSync(tool)) {
 		const actual = sha256File(tool);
@@ -207,7 +215,7 @@ async function appimagetool(): Promise<string> {
 		}
 		return tool;
 	}
-	const response = await fetch(APPIMAGETOOL.url);
+	const response = await download(APPIMAGETOOL.url);
 	if (!response.ok) throw new Error(`downloading ${APPIMAGETOOL.url} failed: HTTP ${response.status}`);
 	const data = Buffer.from(await response.arrayBuffer());
 	const actual = createHash("sha256").update(data).digest("hex");
